@@ -65,8 +65,8 @@ use crate::placement::{
 use gguf::digest::hex;
 
 use runtime::stores::{
-    DELTA_LANES, F32_BYTES, delta_lane_bytes, dense_kv_bytes, kv_plane_bytes, ple_ring_bytes,
-    recurrent_bytes, selecting_bytes,
+    DELTA_LANES, F32_BYTES, delta_carry_bytes, delta_lane_bytes, dense_kv_bytes, kv_plane_bytes,
+    ple_ring_bytes, recurrent_bytes, selecting_bytes,
 };
 pub use runtime::stores::{PASS_ROWS, conv_ring_rows, ple_ring_rows};
 
@@ -1033,20 +1033,21 @@ fn draft_card_bytes(d: &placement::CardTotals, map_bytes: u64) -> u64 {
 /// `vocab` f32; the readback 18 u32, its ticket count, the stand-in map word
 /// and the chain's 10 words; the taps none (the engine's walk arms none) —
 /// 1,212,160 + 8 · `vocab` f32 and 793 u32; then the store walk's arena for 64
-/// rows, 5,039,634 values: the hidden rows 655,360, the embedding 163,840 and
+/// rows, 5,049,938 values: the hidden rows 655,360, the embedding 163,840 and
 /// its positions and key counts 128, the pack 1,310,720 and its 32-value q8
 /// blocks over 256 columns of 5,120 (codes, scales and sums, 20 words a
 /// 64-value step) 409,600, the streams 655,360, the wide mix's scratch
-/// 1,563,392 (the normed streams and the up's rows 655,360 each, the q8 of the
+/// 1,573,696 (the normed streams and the up's rows 655,360 each, the q8 of the
 /// normed streams 204,800, the down's dots and the bottleneck 20,480 each, its
-/// q8 6,400, the inject's dots and the weights 256 each), the mix 163,840 and
+/// q8 6,400, its BF16 pairs 10,240 and refusals 64, the inject's dots and
+/// the weights 256 each), the mix 163,840 and
 /// its q8 51,200, the keys and values 65,536, and the two one-expert tables
 /// of 256 and 64 slots, 524 and 134 words — four bytes a value].
 ///
 /// [`MtpArena::new`]: bloomery_gpu::arch::qwen3moe::Mtp38
 #[must_use]
 pub fn mtp_arena_bytes(vocab: u64) -> u64 {
-    4 * (1_212_160 + 8 * vocab + 49_536 * MTP_FLASH_SEGMENTS + 793 + 5_039_634)
+    4 * (1_212_160 + 8 * vocab + 49_536 * MTP_FLASH_SEGMENTS + 793 + 5_049_938)
 }
 
 /// The decode flash's segments a row of the MTP program's arena holds
@@ -1125,18 +1126,22 @@ impl MtpPlan<'_> {
 pub const UBATCH_PLANNED: u64 = 4096;
 
 /// Card bytes a qwen4exp ubatch walk holds a position [derived: the ubatch
-/// arena's token-major rows, 136,996 f32 and 12 u32 a position — the
+/// arena's token-major rows, 130,852 f32 and 12 u32 a position — the
 /// embedding, the two stream buffers, the mix and sub-layer outputs, the
-/// attention and flash rows, the delta layer's, the selecting layer's and the
-/// PLE site's intermediates, the shared expert's — 548,032 B; the walk's own
-/// buffers, 110,000.125 B — the 32-value activations of the model-width, the
+/// attention rows, the delta layer's, the selecting layer's and the PLE
+/// site's intermediates, the shared expert's — 523,456 B; the walk's own
+/// buffers, 110,644.125 B — the 32-value activations of the model-width, the
 /// attention-width and the SwiGLU rows (3,200, 7,680 and 800 B), the wide
-/// mixes' scratch (97,712 B: the normed streams and the up's rows at 40,960 B
+/// mixes' scratch (98,356 B: the normed streams and the up's rows at 40,960 B
 /// each, their activations, the down's and inject's dots, the bottleneck and
-/// its activations, the weights), the indexer keys, the slots and the
-/// one-expert table; the record's id word and the host sums (10,244 B);
+/// its Q8 activations, BF16 pairs and refusal, the weights), the indexer
+/// keys, the slots and the one-expert table; the record's id word and the
+/// host sums (10,244 B);
 /// rounded up].
-pub const UBATCH_TOKEN_BYTES: u64 = 668_277;
+// PIN(2026-10-24): the HC bottleneck adds 320 BF16 values and one refusal word per column, 644 B.
+// PIN(2026-10-25): 644,345 (was 668,921): the prefill flash stores the selecting layer's rows
+// under their gate, so the arena holds no flash rows, 6,144 f32 a position.
+pub const UBATCH_TOKEN_BYTES: u64 = 644_345;
 
 /// Card bytes a qwen4exp ubatch walk's selection holds for one run of its
 /// selecting rows: the walk takes as many rows a run as these bytes hold at
@@ -1150,8 +1155,9 @@ pub const SELECT_RUN_BYTES: u64 = 22_000_000;
 /// up to 2,000,000 positions [derived, an upper bound: the router's buffers
 /// for 2,048 tokens, 8,577,028 B; the eight-column mix scratch, 379,520 B;
 /// the selection's run, at most [`SELECT_RUN_BYTES`] (the least run, eight
-/// rows, holds 16,082,048 B at 2,000,000); 30,956,548 B, rounded up to
-/// 32 MiB]. A load whose ubatch arena passes it refuses the arena by name.
+/// rows, holds 16,082,048 B at 2,000,000); the delta layers' chunk records
+/// past the q·k·v rows of a walk of up to five positions, at most 133,124 B;
+/// 31,089,672 B, rounded up to 32 MiB]. A load whose ubatch arena passes it refuses the arena by name.
 pub const UBATCH_FIXED_BYTES: u64 = 32 << 20;
 
 /// The card bytes a qwen4exp ubatch walk of up to `u` positions holds: what
@@ -1621,7 +1627,8 @@ fn check_draft_reserve(machine: &Machine, want: Option<u64>) -> Result<(), Place
 ///   channels, `2·k_heads·state + v_heads·state`, in f32), both fixed by the
 ///   file; on a qwen4exp file its state keeps
 ///   `runtime::stores::DELTA_LANES` lanes, each stamped
-///   (`runtime::stores::delta_lane_bytes`); a qwen35moe load that verifies
+///   (`runtime::stores::delta_lane_bytes`), and a carry
+///   (`runtime::stores::delta_carry_bytes`); a qwen35moe load that verifies
 ///   drafted rows asks for its own count ([`KvLayout::of_lanes`]);
 /// - the PLE site's layer, beside that: the PLE conv ring
 ///   (`(taps − 1)·dilation + PASS_ROWS` rows of `streams · n_embd` f32);
@@ -1639,7 +1646,8 @@ pub struct KvLayout {
     /// A GDN layer's state and conv ring, in bytes.
     recurrent: u64,
     /// What one checkpoint copies of a GDN layer: the committed state lane
-    /// and the conv ring ([`recurrent_bytes`], without the other lanes).
+    /// and the conv ring ([`recurrent_bytes`], without the other lanes), and
+    /// the carry on a qwen4exp file.
     copy: u64,
     /// The PLE site's layer and its conv ring's bytes.
     ple: Option<(usize, u64)>,
@@ -1680,10 +1688,11 @@ impl KvLayout {
     pub fn of_lanes(hp: &Hparams, lanes: usize) -> KvLayout {
         let exp = hp.exp.as_ref();
         let (recurrent, copy) = gdn_bytes(hp.v_heads, hp.k_heads, hp.state, hp.conv, lanes);
+        let carry = exp.map_or(0, |_| delta_carry_bytes(hp.v_heads, hp.k_heads, hp.state));
         KvLayout {
             kinds: hp.kinds.clone(),
-            recurrent,
-            copy,
+            recurrent: recurrent + carry,
+            copy: copy + carry,
             ple: exp.and_then(|e| e.ple).map(|p| {
                 (
                     p.layer,
@@ -2389,20 +2398,22 @@ impl KvBytes for MtpKv {
 #[cfg(test)]
 mod tests {
     use super::{
-        DELTA_LANES, Kind, KvBytes, KvLayout, delta_lane_bytes, gdn_bytes, ple_ring_bytes,
-        recurrent_bytes,
+        DELTA_LANES, Kind, KvBytes, KvLayout, delta_carry_bytes, delta_lane_bytes, gdn_bytes,
+        ple_ring_bytes, recurrent_bytes,
     };
 
     /// Qwen3.8's layers by kind (the sizes themselves are
-    /// `runtime::stores`'s, pinned there): a GDN layer's state lanes and conv ring,
-    /// the PLE ring beside it on its layer, an attention layer's K/V, raw and
+    /// `runtime::stores`'s, pinned there): a GDN layer's state lanes, conv
+    /// ring and carry, the PLE ring beside it on its layer, an attention layer's K/V, raw and
     /// pooled keys at a context of whole pools and one past.
     #[test]
     fn qwen38_layer_bytes() {
         let kv = KvLayout {
             kinds: vec![Kind::DeltaRule, Kind::DeltaRule, Kind::Attention],
-            recurrent: recurrent_bytes(48, 16, 128, 4) + delta_lane_bytes(48, 128, DELTA_LANES),
-            copy: recurrent_bytes(48, 16, 128, 4),
+            recurrent: recurrent_bytes(48, 16, 128, 4)
+                + delta_lane_bytes(48, 128, DELTA_LANES)
+                + delta_carry_bytes(48, 16, 128),
+            copy: recurrent_bytes(48, 16, 128, 4) + delta_carry_bytes(48, 16, 128),
             ple: Some((1, ple_ring_bytes(4, 3, 4, 2560))),
             kv_heads: 2,
             head_dim: 256,
@@ -2410,8 +2421,11 @@ mod tests {
             q8: false,
             rope_row: 64 * 4,
         };
-        assert_eq!(kv.layer_bytes(0, 4096), 3_596_288 + 9_437_200);
-        assert_eq!(kv.layer_bytes(1, 4096), 3_596_288 + 9_437_200 + 696_320);
+        assert_eq!(kv.layer_bytes(0, 4096), 3_596_288 + 9_437_200 + 497_296);
+        assert_eq!(
+            kv.layer_bytes(1, 4096),
+            3_596_288 + 9_437_200 + 497_296 + 696_320
+        );
         assert_eq!(kv.layer_bytes(2, 4096), 4096 * 2304 + 1024 * 256);
         assert_eq!(kv.layer_bytes(2, 4097), 4097 * 2304 + 1025 * 256);
         assert_eq!(kv.layer_bytes(3, 4096), 0);
@@ -2533,9 +2547,9 @@ mod tests {
     /// One saved sequence state of Qwen3.8's 48 layers (36 GDN, every fourth
     /// one attention, the PLE ring on layer 1) at a context of whole pools
     /// [derived]: twelve attention layers' 2,304 B a position and 256 B a
-    /// pool of four, and two checkpoints of 36 · 3,596,288 B (the committed
-    /// lane and conv ring, not the four lanes a layer holds) and the PLE
-    /// ring's 696,320 B.
+    /// pool of four, and two checkpoints of 36 · 4,093,584 B (the committed
+    /// lane, conv ring and carry, not the four lanes a layer holds) and the
+    /// PLE ring's 696,320 B.
     #[test]
     fn qwen38_state_bytes() {
         let kv = KvLayout {
@@ -2548,8 +2562,10 @@ mod tests {
                     }
                 })
                 .collect(),
-            recurrent: recurrent_bytes(48, 16, 128, 4) + delta_lane_bytes(48, 128, DELTA_LANES),
-            copy: recurrent_bytes(48, 16, 128, 4),
+            recurrent: recurrent_bytes(48, 16, 128, 4)
+                + delta_lane_bytes(48, 128, DELTA_LANES)
+                + delta_carry_bytes(48, 16, 128),
+            copy: recurrent_bytes(48, 16, 128, 4) + delta_carry_bytes(48, 16, 128),
             ple: Some((1, ple_ring_bytes(4, 3, 4, 2560))),
             kv_heads: 2,
             head_dim: 256,
@@ -2560,13 +2576,13 @@ mod tests {
             q8: false,
             rope_row: 64 * 4,
         };
-        let checkpoint = 36 * 3_596_288 + 696_320;
+        let checkpoint = 36 * 4_093_584 + 696_320;
         assert_eq!(kv.state_bytes(0), 2 * checkpoint);
         assert_eq!(
             kv.state_bytes(262_144),
             12 * (262_144 * 2304 + 65_536 * 256) + 2 * checkpoint
         );
-        assert_eq!(kv.state_bytes(262_144), 7_709_409_280);
+        assert_eq!(kv.state_bytes(262_144), 7_745_214_592);
         assert_eq!(
             kv.state_bytes(4097),
             12 * (4097 * 2304 + 1025 * 256) + 2 * checkpoint
@@ -3051,12 +3067,13 @@ mod tests {
         // PIN(2026-10-24): the store walk holds no query rows or turned
         // queries, 4,718,592 B fewer [derived: 64 rows · (12,288 + 6,144) f32
         // · 4 B; 53,526,700 - 4,718,592 = 48,808,108 B].
+        // PIN(2026-10-24): the HC bottleneck's BF16 pairs and refusal add 64 · 644 = 41,216 B.
         #[test]
         fn the_mtp_arena_formula() {
-            assert_eq!(mtp_arena_bytes(248_320), 48_808_108);
+            assert_eq!(mtp_arena_bytes(248_320), 48_849_324);
             assert_eq!(
                 mtp_arena_bytes(248_320),
-                4 * (1_212_160 + 8 * 248_320 + 49_536 * 80 + 793 + 5_039_634)
+                4 * (1_212_160 + 8 * 248_320 + 49_536 * 80 + 793 + 5_049_938)
             );
             assert_eq!(mtp_arena_bytes(248_321) - mtp_arena_bytes(248_320), 4 * 8);
         }

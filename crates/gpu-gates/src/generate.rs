@@ -479,7 +479,7 @@ impl Place {
     /// tier cards on `nodes` when it is not empty, and `margin` on each
     /// resolved card's spec at the end of either path, so a margin reaches the
     /// machine's cards the same way whatever the cards came from.
-    fn on_with(
+    pub(crate) fn on_with(
         self,
         census: &[DeviceInfo],
         budget: &card_budget::CardBudget,

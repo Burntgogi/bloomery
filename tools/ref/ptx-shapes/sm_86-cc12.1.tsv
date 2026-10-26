@@ -20,6 +20,8 @@ generate_ds41   bf16_cols                                0           0
 generate_ds41   bf16_gemv                                0           0
 generate_ds41   bf16_gemv_ids                            0           0
 generate_ds41   bf16_mma_cols_gemm                       0           0
+# PIN(2026-10-25): formed BF16 norm-gate spill and GB10 JIT local measured with ptxas 13.3.73, driver 595.84, sm_86.
+generate_ds41   bf16_mma_norm_gate                       0         160
 generate_ds41   bf16_mma_gemm                            0           0
 generate_ds41   bf16_tile_gemm                           0           0
 generate_ds41   cand_block_max                           0           0
@@ -139,9 +141,13 @@ generate_ds41   gap_coop_sync                            0           0
 generate_ds41   gap_plain                                0           0
 generate_ds41   gate_up_swiglu_q3k                       0           0
 generate_ds41   gather_pairs                             0           0
+generate_ds41   gdn_carry_keep                           0           0
+generate_ds41   gdn_chunk_prepare                        0           0
 generate_ds41   gdn_conv_prep                            0           0
 generate_ds41   gdn_delta                                0           0
 generate_ds41   gdn_delta_lanes                          0           0
+generate_ds41   gdn_delta_recovery                       0           0
+generate_ds41   gdn_delta_prepared                       0           0
 generate_ds41   gdn_norm_gate                            0           0
 generate_ds41   gdn_norm_gate_sigmoid                    0           0
 generate_ds41   geglu_tanh                               0           0
@@ -172,9 +178,6 @@ generate_ds41   gemm_route_remap                         0           0
 generate_ds41   gemm_swiglu_quant                        0           0
 generate_ds41   glm5next_router                          0           0
 generate_ds41   glm5next_router_pick                     0           0
-# PIN(2026-10-24): 0 -> 8 JIT local bytes (ptxas 13.3.73 at sm_86 spills none; GB10 cc 12.1, driver 595.84),
-# measured; this entry's PTX is the same before and after the dense MMA tile's activation source.
-generate_ds41   gqa_flash_fold_mma_256_p12_sel           0           8
 generate_ds41   gqa_flash_merge                          0           0
 generate_ds41   gqa_flash_merge_256                      0           0
 generate_ds41   gqa_flash_merge_sink                     0           0
@@ -200,7 +203,10 @@ generate_ds41   gqa_prefill_flash_256                    0           0
 generate_ds41   gqa_prefill_flash_256_p2                 0           0
 generate_ds41   gqa_prefill_flash_256_p2_lower           0           0
 generate_ds41   gqa_prefill_flash_256_p1_lower           0           0
+generate_ds41   gqa_prefill_flash_256_p12_sel            0           0
+generate_ds41   gqa_prefill_flash_256_p12_sel_gated      0           0
 generate_ds41   gqa_prefill_flash_256_p4                 0           0
+generate_ds41   gqa_prefill_flash_256_p4_gated           0           0
 generate_ds41   gqa_prefill_flash_256_q8                 0           0
 generate_ds41   gqa_prefill_flash_512_p4                 0           0
 generate_ds41   gqa_prefill_flash_q8                     0           0
@@ -233,7 +239,11 @@ generate_ds41   hc_gated_up_mix_bf16_1col                0           0
 # PIN(2026-10-24): 1352 -> 484 spill bytes, 176 -> 88 driver-JIT local bytes (ptxas 13.3.73 sm_86, GB10
 # driver 595.84): the exact-tile replay it inlines now sums two rows a thread a pass over the shared
 # two-lanes-a-thread tile body.
-generate_ds41   hc_gated_up_mma_mix_4                  484          88
+# PIN(2026-10-25): HC up BF16 input: sm_86 spill 484 -> 608 B, GB10 JIT local unchanged at 88 B; native sm_121/sm_121a spill 364 -> 332 B; deferred flags and u32 columns each measured 532 B spill / 96 B JIT local.
+generate_ds41   hc_gated_up_mma_mix_4                  608          88
+# PIN(2026-10-25): the HC up/mix that also writes mixed's BF16 form, spill and GB10 JIT local measured with
+# ptxas 13.3.73, driver 595.84, sm_86.
+generate_ds41   hc_gated_up_mma_mix_4_bf16             676          88
 generate_ds41   hc_gated_up_mix_bf16_4x320               0           0
 generate_ds41   hc_pre_q8_0                              0           0
 generate_ds41   head_norm_neox_append                    0           0
@@ -363,9 +373,11 @@ generate_ds41   quantize_gemm32                          0           0
 generate_ds41   qwen35moe_router_fused                   0           0
 generate_ds41   qwen35moe_router_fused_512               0           0
 generate_ds41   qwen35moe_router_fused_512_bf16          0           0
+generate_ds41   qwen35moe_router_fused_512_bf16_mma      0           0
 generate_ds41   qwen35moe_router_logits                  0           0
 generate_ds41   qwen35moe_router_logits_512              0           0
 generate_ds41   qwen35moe_router_logits_512_bf16         0           0
+generate_ds41   qwen35moe_router_logits_512_bf16_mma     0           0
 generate_ds41   qwen35moe_router_norm                    0           0
 # PIN(2026-10-14): on cc 12.1 the driver JIT gives qwen35moe_router_norm_m 64 registers (.minnctapersm 4: 4 blocks of 256 threads an SM) and keeps 8 bytes a thread in local memory, where the cc 8.6 JIT keeps 0 (tools/ref/ptx-shapes.tsv).
 # PIN(2026-10-24): 8 -> 0 driver-JIT local bytes (ptxas 13.3.73 sm_86, GB10 driver 595.84).
@@ -480,8 +492,10 @@ generate_ds41     nemotron_moe_router_432_pick                 0           0
 generate_ds41     nemotron_moe_router_496                      0           0
 generate_ds41     nemotron_moe_router_496_pick                 0           0
 generate_ds41     nvfp4_gate_up_sel                            0           0
+generate_ds41     nvfp4_gate_up_sel_cols                       0           0
 generate_ds41     nvfp4_gemv                                   0           0
 generate_ds41     nvfp4_gemv_sel32                             0           0
+generate_ds41     nvfp4_gemv_sel32_cols                        0           0
 generate_ds41     nvfp4_gemv_sel_f32                           0           0
 generate_ds41     relu_sqr                                     0           0
 # PIN(2026-10-24): 0.3.9's generate_ds41 entries carry the cc 8.6 scan's values; no cc 12.1 scan has run on them yet.

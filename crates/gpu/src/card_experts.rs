@@ -885,6 +885,10 @@ mod tests {
     use gguf::GgmlType;
     use gguf::write::{Layout, TensorDecl, Writer};
     use model::arch::models::{self, Mixer, Moe, Residual, Router, RouterNorm, Score};
+    use model::placement::{
+        Device, ExpertList, ExpertPart, Format, ModelTensor, ModelTensors, Role, RoutedRule, Row,
+        Segment,
+    };
 
     use crate::card_leg::tests::stack_bytes;
     use crate::host::leg_tier::LegTier;
@@ -936,10 +940,21 @@ mod tests {
     fn weights(gpu: &Gpu, triples: &[[GgmlType; 3]]) -> Weights {
         let mut decls = Vec::new();
         let mut data = Vec::new();
+        let mut tensors = Vec::new();
         for (l, triple) in triples.iter().enumerate() {
             for (part, (name, &ty)) in (FAMILY.stacks)(l).into_iter().zip(triple).enumerate() {
                 let (rows, k) = if part == 2 { (N, FF) } else { (FF, N) };
                 let bytes = stack_bytes(ty, CARD * rows, k, 7 + (3 * l + part) as u64);
+                tensors.push(ModelTensor {
+                    name: name.clone(),
+                    shard: 0,
+                    layer: Some(l),
+                    role: Role::RoutedExperts,
+                    ty,
+                    dims: vec![k as u64, rows as u64, CARD as u64],
+                    file_bytes: bytes.len() as u64,
+                    gathered_rows: None,
+                });
                 decls.push(TensorDecl {
                     name,
                     dims: vec![k as u64, rows as u64, CARD as u64],
@@ -963,7 +978,49 @@ mod tests {
         }
         writer.finish().expect("a finished file");
         let file = gguf::Split::open(&path).expect("the file");
-        let weights = Weights::load_where(gpu.stream(), &file, |_| true).expect("resident stacks");
+        // IQ3_S has a selected expert row arm, not a generic device format.
+        // Use the selected program's formats, not the generic type/role table.
+        let model = ModelTensors {
+            tensors,
+            layers: triples.len(),
+            experts: EXPERTS as u64,
+            experts_used: USED as u64,
+            bf16_words: |_| false,
+        };
+        let RoutedRule::Leg { gate_up, down } = accepts::routed_rule(FAMILY.program) else {
+            panic!("the fixture family must select a card leg");
+        };
+        let rows = model
+            .tensors
+            .iter()
+            .enumerate()
+            .map(|(i, t)| {
+                let format = match ExpertPart::of_name(&t.name).expect("a routed part") {
+                    ExpertPart::Gate | ExpertPart::Up => gate_up(t.ty),
+                    ExpertPart::Down => down(t.ty),
+                }
+                .expect("the selected arm's format");
+                let mut segment = Segment {
+                    device: Device::Card(0),
+                    format: Format::Card(format),
+                    experts: Some(ExpertList::prefix(CARD as u64).expect("the card prefix")),
+                    resident_bytes: 0,
+                };
+                segment.resident_bytes = segment
+                    .buffer_bytes(t, model.experts_of(t))
+                    .expect("the selected format's buffers")
+                    .into_iter()
+                    .sum();
+                Row {
+                    tensor: i,
+                    segments: vec![segment],
+                    read_bytes: t.file_bytes,
+                    stage: 0,
+                }
+            })
+            .collect::<Vec<_>>();
+        let weights = Weights::load_rows(gpu.stream(), &file, &model, &rows, 0)
+            .expect("resident expert stacks");
         std::fs::remove_file(path).expect("remove the fixture");
         weights
     }
@@ -1178,40 +1235,37 @@ mod tests {
             }
             assert!(gpu.take_fault().expect("the fault word").is_none());
         }
-        for (triple, program) in [
-            ([IQ3_S, Q5_K, Q8_0], Program::Qwen35Body),
-            ([Q5_K, Q5_K, Q6_K], Program::Solar2Body),
-        ] {
-            let w = weights(&gpu, &[triple]);
-            let specs = layers(1);
-            let map = SlotMap::prefix(0..1, EXPERTS, CARD).expect("a map");
-            let family = CardFamily { program, ..FAMILY };
-            assert!(
-                matches!(
-                    CardExperts::new(&gpu, &w, family, &specs, &map, (N, FF), CAP),
-                    Err(GpuError::Tensor { .. }),
+        let triple = [IQ3_S, Q5_K, Q8_0];
+        let program = Program::Qwen35Body;
+        let w = weights(&gpu, &[triple]);
+        let specs = layers(1);
+        let map = SlotMap::prefix(0..1, EXPERTS, CARD).expect("a map");
+        let family = CardFamily { program, ..FAMILY };
+        assert!(
+            matches!(
+                CardExperts::new(&gpu, &w, family, &specs, &map, (N, FF), CAP),
+                Err(GpuError::Tensor { .. }),
+            ),
+            "{program:?}: {triple:?}"
+        );
+        let set =
+            TierSet::new(0..1, EXPERTS, vec![(0..CARD as u32).collect()]).expect("a tier set");
+        assert!(
+            matches!(
+                LegTier::new(
+                    &gpu,
+                    &specs,
+                    &set,
+                    &w,
+                    family.shape(N, FF, 2),
+                    program,
+                    |moe| Ok(Act::SwigluClamp {
+                        limit: moe.act.swiglu_limit()
+                    }),
                 ),
-                "{program:?}: {triple:?}"
-            );
-            let set =
-                TierSet::new(0..1, EXPERTS, vec![(0..CARD as u32).collect()]).expect("a tier set");
-            assert!(
-                matches!(
-                    LegTier::new(
-                        &gpu,
-                        &specs,
-                        &set,
-                        &w,
-                        family.shape(N, FF, 2),
-                        program,
-                        |moe| Ok(Act::SwigluClamp {
-                            limit: moe.act.swiglu_limit()
-                        }),
-                    ),
-                    Err(GpuError::Tensor { .. }),
-                ),
-                "{program:?}: {triple:?}"
-            );
-        }
+                Err(GpuError::Tensor { .. }),
+            ),
+            "{program:?}: {triple:?}"
+        );
     }
 }

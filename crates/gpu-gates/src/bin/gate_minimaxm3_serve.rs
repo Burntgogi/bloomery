@@ -17,8 +17,11 @@
 //! The plan and slot clauses are this file's. The load and the chat are the shared ones
 //! (`shared/serve_gate.rs`): the seat loads the file at the context it was asked for, answers a
 //! chat turn with its reasoning split at the model's tags and ends its turn at the model's own
-//! end token. The model's facts are this file's: the think tags and the turn end are written
-//! here as the model's vocabulary spells them; the seat reads the tags from the model's
+//! end token, and keeps the prefix a request shares with the slot the server holds
+//! (`live_slot_keeps_the_prefix`: its cut keeps every held position, so the shorter shared
+//! prefix is kept whole and its cached answer equals the uncached one on a server whose
+//! residency is off). The model's facts are this file's: the think tags and the turn end are
+//! written here as the model's vocabulary spells them; the seat reads the tags from the model's
 //! description (`models::ReasoningFormat::ThinkSpan`).
 //!
 //! - `slots_total_is_planned`: `--parallel 2 --ctx` [`CTX`] `--plan` exits 0 and its stderr
@@ -76,6 +79,20 @@
 //!   neither a span nor the turn end, so the last two clauses are `Tag::FileBound` and the
 //!   fixture tier leaves them to the real tier by name; the end id's place in the vocabulary is
 //!   pinned on any machine by `tokenizer`'s `a_familys_turn_end_token_ends_generation`.
+//! - `saved_state_returns` (shared, `serve_gate::saved_state_returns`, on the server of
+//!   `load_and_listen`): the seat prints a `cache` line with a budget above 0 (a seat with none
+//!   skips the clause by name). Raw-id conversation A of 1024 ids is opened by its head (its ids
+//!   less the last) and answered, so the live slot holds the head's rows and A continues it by one
+//!   id: that answer is the truth. An unrelated conversation B of 256 ids takes the slot and A
+//!   returns: `timings.cache_n` is at least 1023 (restored from the saved state, not fed again)
+//!   and, where the server's `residency lever` record is `off` (any other word skips this half by
+//!   name), the ids equal the truth's, the same arithmetic on the same rows. Then B takes the slot
+//!   again and A returns extended by its answer and a tail: `cache_n` is at least A's 1024 ids.
+//!   An uncached run is no oracle: another cut of the prompt or its answer's stepped rows in a
+//!   prompt pass differ by rounding. FAIL-first: a resume that puts back one position leaves
+//!   `cache_n` at 1 and the clause is red on it; one that stands at the positions asked over the
+//!   rows of one is red on the ids (the fixture cut answers one id whatever the rows: that half is
+//!   the real tier's).
 //! - `chat_answers_a_turn`: the same request, on either tier, is a 200 whose `usage` counts a
 //!   prompt and at most 512 completion tokens, whose message holds neither think tag, and whose
 //!   `finish_reason` is `stop` or `length`. FAIL-first: a seat whose engine ends the request
@@ -227,6 +244,9 @@ mod gate {
             think: THINK_TAGS,
             turn_end: TURN_END,
             ctx: CTX,
+            // Every store is a plane of positions, so the session's cut keeps every held
+            // position (`app::Keep`, crates/app/src/arch/minimaxm3/mod.rs:11).
+            cut: serve_gate::Cut::EveryPosition,
         })
     }
 
@@ -419,8 +439,9 @@ mod gate {
         println!(
             "PASSED: {} the seat plans two slots (pass=turns), two concurrent greedy requests \
              each equal their solo run, the second solo run a fresh server's own, loads at the \
-             context it was asked for, and answers a chat turn with its reasoning split at the \
-             model's tags",
+             context it was asked for, answers a chat turn with its reasoning split at the \
+             model's tags, and keeps the prefix a request shares with the slot \
+             (live_slot_keeps_the_prefix)",
             c.gate
         );
         Ok(())

@@ -16,9 +16,6 @@ use crate::fault::MetalFaultWord;
 use super::geometry::ROWS_PER_SIMD_GROUP;
 use super::{Kernels, Quant, args_bytes, check_window_len, pack, word};
 
-/// The vocabulary the engine's head reads.
-pub const HEAD_VOCAB: usize = 248_320;
-
 /// The columns of every row.
 pub const HEAD_K: usize = 2048;
 
@@ -32,20 +29,23 @@ pub const HEAD_THREADS: usize = 256;
 /// geometry's rows each.
 const ROWS_PER_THREADGROUP: usize = HEAD_SIMD_GROUPS * ROWS_PER_SIMD_GROUP;
 
-/// The threadgroups of the engine's head.
-pub const HEAD_GROUPS: usize = HEAD_VOCAB / ROWS_PER_THREADGROUP;
-
 const _: () = assert!(HEAD_THREADS == 32 * HEAD_SIMD_GROUPS);
-const _: () = assert!(HEAD_VOCAB.is_multiple_of(ROWS_PER_THREADGROUP));
-const _: () = assert!(HEAD_GROUPS * ROWS_PER_THREADGROUP == HEAD_VOCAB);
+
+/// The threadgroups of a head over `rows` rows, which is also the length of
+/// its candidates: one per threadgroup's rows, the last owning the remainder
+/// when the count is not a multiple.
+#[must_use]
+pub const fn head_groups(rows: usize) -> usize {
+    rows.div_ceil(ROWS_PER_THREADGROUP)
+}
 
 /// One head launch.
 pub struct HeadParams<'w> {
     /// The weight type. Q6_K and A4 have a head entry; Q4_K has none and is
     /// refused by name.
     pub quant: Quant,
-    /// The output rows. The engine's head reads [`HEAD_VOCAB`]. A launch
-    /// accepts any positive count, so a clause can run a shorter grid.
+    /// The output rows: the file's vocabulary for the engine's head. A launch
+    /// accepts any positive count.
     pub rows: usize,
     /// The columns, a positive multiple of the type's block values. The
     /// engine's head reads [`HEAD_K`].
@@ -61,7 +61,7 @@ pub struct HeadParams<'w> {
     pub gain: Window<'w, f32, MetalDevice>,
     /// The logits, `rows` values.
     pub logits: WindowMut<'w, f32, MetalDevice>,
-    /// One packed candidate per threadgroup, `rows.div_ceil(16)` values.
+    /// One packed candidate per threadgroup, [`head_groups`]`(rows)` values.
     pub candidates: WindowMut<'w, u64, MetalDevice>,
     /// The ticket counter, one `u32`. The caller stores 0 before the first
     /// launch, and the kernel stores 0 again when it finishes.

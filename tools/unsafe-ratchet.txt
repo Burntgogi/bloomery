@@ -552,12 +552,65 @@ gguf 7 2 0
 # PIN(2026-10-24): gpu 2414 -> 2418 blocks, new code, not old code relaxed: the two branch pins the rebase onto main
 # folded away, the four-slot tier handoff (ds41_ffn_handoff_4_tier, +2) and Muse's attention branch (its fork and join,
 # +2); 2331 + 83 + 2 + 2, recounted by tools/check-unsafe.sh.
+# PIN(2026-10-25): gpu 2417 -> 2433 blocks, 311 -> 312 fns, new code, not old code relaxed: the NVFP4 selected-expert
+# entries for runs of several tokens (mxfp4_sel.rs nvfp4_gate_up_sel_cols and nvfp4_gemv_sel32_cols): each one's id
+# read, its first-slot check, its scale reads, its slot scan, its lane_partials calls and its row writes, the gate·up
+# NaN row write, and names_before (the fn) with its sel read, each with its SAFETY line.
+# PIN(2026-10-24): gpu 2331 -> 2333 blocks, new code, not old code relaxed: HC's bottleneck
+# writes its BF16 pairs through land_values and its column refusal through store_refused, each with its SAFETY line.
+# PIN(2026-10-24): gpu 2331 -> 2353 blocks, 306 -> 310 fns, new code, not old code relaxed: the Qwen3.8 BF16
+# router on the dense MMA tile. f32tile.rs's narrow block (`bf16_mma_narrow`, an unsafe fn: its two cp.async copies,
+# the group commits and waits, the ldmatrix, the two column loads, the MMA, the vote store and load) and its store
+# (`NarrowTile::store`, an unsafe fn, one output store); router.rs's fused row sums (`fused_row_sums`, an unsafe fn,
+# the fused body's two lane-partial calls moved into it, and the call), the MMA fused body (`gated_mma_fused_body`,
+# an unsafe fn: the narrow call, the store, the replay's row sums and store, the publish) and the two `_bf16_mma`
+# entries' shared-memory views and body calls. Each block has its SAFETY line.
+# PIN(2026-10-24): gpu 2331 -> 2427 blocks, 306 -> 310 fns, new code, not old code relaxed: the GDN prompt form
+# (linear/delta.rs): gdn_chunk_prepare's, gdn_delta_prepared's and gdn_carry_keep's shared, record and carry reads and
+# writes, one memory operation a block (the chunk's decays, beta, products, inverse and record words; the walk's
+# tiles, projections, solved rows, state cells and stamp; the carry's rows, beta, decays and header), the carried rows
+# gdn_delta_lanes runs first, and four device fns: chunk_mma, chunk_qk_regs and chunk_qk_store, which the two chunk
+# kernels share, and carried_rows, the carry header's read. Each block has its SAFETY line.
+# PIN(2026-10-24): gpu 2427 -> 2446 blocks: the GDN recovery entry, its record header and payload reads
+# and writes, plus one memory operation per block in the shared stamped delta loop. Each has its SAFETY invariant.
+# PIN(2026-10-24): gpu 2331 -> 2344 blocks, 306 -> 307 fns: bf16_mma_norm_gate_body
+# calls the shared product and exact replay owners, stages each head slab and reads o, z and gain before its
+# output stores; its kernel takes the shared view and calls it. The standalone SiLU norm now uses the shared
+# norm body, whose input reads each have one SAFETY block. Each new block has its own SAFETY line.
+# PIN(2026-10-25): gpu 2433 -> 2601 blocks, 312 -> 321 fns, new code, not old code relaxed:
+# integrated native NVFP4 staging, HC BF16 form, router MMA, chunked GDN, recovery, listed attention
+# and the BF16 norm epilogue; counted by tools/check-unsafe.sh. Each new block has its SAFETY invariant.
+# PIN(2026-10-25): gpu 2601 -> 2605 blocks, 321 -> 324 fns, new code, not old code relaxed: the prefill
+# flash's store gate (flash_gqa_prefill.rs: `OutGate::apply` declared and its two impls, the sigmoid gate's
+# read of its gate value, the store's call of it, and the two gated entries' calls of their bodies), counted
+# by tools/check-unsafe.sh. Each new block has its SAFETY line.
+# PIN(2026-10-25): gpu 2605 -> 2621 blocks, 324 -> 326 fns: the GDN split-operand
+# product and keys-by-time transpose, residual record/staging planes and retained projections.
+# Each block has its SAFETY invariant; the two new unsafe fns state their tile contracts.
+# PIN(2026-10-25): gpu 2621 -> 2627 blocks, new code, not old code relaxed: the MXFP8 W8A8 gate projection's
+# kernel (nvfp4mma.rs `mxfp8_w8a8_norm_gate`: its shared allocation and its call of the shared norm-epilogue
+# body), counted by tools/check-unsafe.sh. Each new block has its SAFETY line.
+# PIN(2026-10-25): gpu 2621 -> 2627 blocks, 326 -> 329 fns, new code, not old code relaxed: the norm epilogue's
+# output form (f32tile.rs `NormForm::store`, its empty impl and nvfp4mma.rs `Mxfp8Out`'s, which writes the
+# MXFP8 gate projection's output words, scale word and refusal OR; and the epilogue body's call of it),
+# counted by tools/check-unsafe.sh. Each new block has its SAFETY line.
+# PIN(2026-10-25): gpu 2627 -> 2640 blocks, 329 -> 334 fns, new code, not old code relaxed: the epilogue
+# output forms (f32tile.rs `OutForm::store` made const-sized, `Bf16Out` with its pair writer and
+# `refuse_or`; nvfp4mma.rs `Mxfp8Out::block`; hc_gated.rs `up_mma_mix_body` with its read-back of the tile's
+# mixed values, and the two new entries' calls of their bodies), counted by tools/check-unsafe.sh. Each new
+# block has its SAFETY line.
 # PIN(2026-10-25): gpu 2418 -> 2420 blocks, the six-slot F32 tier entry adds two
 # handoff body calls under its checked launch contract; the newmain baseline is preserved.
 # PIN(2026-10-24): gpu 2420 -> 2475 blocks, 311 -> 315 fns, new code: checked
 # head128 ring append/attention, optional-bias floor router, expert-input scaling
 # and common loaded launchers. Existing entries retain their contracts; each new site states SAFETY.
-gpu 2475 315 10
+# PIN(2026-10-25): gpu 2621 -> 2678 blocks, 326 -> 330 fns: current-main integration
+# retains the six-slot F32 tier entry, head128 ring attention, floor router and
+# expert-input scaling above; recounted by tools/check-unsafe.sh, with each new site's SAFETY contract.
+# PIN(2026-10-26): gpu 2640 -> 2697 blocks, 334 -> 338 fns: Flint's same 57 blocks
+# and four functions over af74ea4's MXFP8/HC epilogue baseline, recounted by tools/check-unsafe.sh.
+# Both histories above retain their SAFETY contracts; no spare allowance is added.
+gpu 2697 338 10
 # PIN(2026-10-01): gpu-deepseek41 459 -> 464 blocks, 51 -> 52 fns, a new kernel entry, not old code relaxed:
 # ds41_ffn_card_acc_8_tier (the tier form of the card sum at 8 slots, chain/ffn/batch.rs) adds its two blocks and
 # card_acc_tier_at (the one unsafe fn) with its three, each with its SAFETY line.
@@ -769,7 +822,9 @@ models 0 0 0
 # and sysctl reads; model and model-hf come down by the five that moved.
 # PIN(2026-10-24): os 30 -> 32 blocks, 5 -> 7 fns, new code, not old code relaxed: advise_huge
 # (madvise(MADV_HUGEPAGE), its Linux and macOS bodies) and its test, each with its SAFETY line.
-os 32 7 0
+# PIN(2026-10-25): os 32 -> 33 blocks, code moved in, not old code relaxed: advise_huge_within (moved from gpu's
+# host_filled advice, gpu comes down by the one that moved), with its SAFETY line.
+os 33 7 0
 placement 0 0 0
 # PIN(2026-10-02): qdot 69 -> 77 blocks, 36 -> 41 fns, new kernels, not old code relaxed: the Q4_K/Q5_K row
 # lanes (pack_lanes_avx2, dot_lanes_avx2 and their helpers transpose8_epi32, transpose8_ps, lane_codes: five

@@ -36,8 +36,8 @@ pub(super) const PASS_ROWS: usize = 8;
 /// (`place::SELECT_RUN_BYTES`) hold at the selection's bytes a row
 /// ([`QsaScratch::row_bytes`]), in whole groups of the score pass's
 /// [`qsa::MAX_ROWS`], at least one group and at most `rows`. Each run uses
-/// two selection launches and one attention launch; attention folds its
-/// segments without partials.
+/// two selection launches and one attention launch, which needs no
+/// partials.
 pub(super) fn select_run(rows: usize, ctx: usize) -> usize {
     let row = QsaScratch::row_bytes(ctx, geo::KEPT) as u64;
     let fit = usize::try_from(model::arch::qwen35moe::place::SELECT_RUN_BYTES / row)
@@ -77,7 +77,7 @@ pub(super) const LANES: usize = stores::DELTA_LANES;
 pub(super) const VERIFY_ROWS: usize = LANES;
 
 /// A layer's store: the delta rule's recurrent state ([`LANES`] lanes), its
-/// lanes' stamps (`linear::delta`'s module doc) and conv ring, or a
+/// lanes' stamps (`linear::delta`'s module doc), conv ring and carry, or a
 /// selecting attention layer's K/V planes with its raw and pooled indexer
 /// keys (`[ctx][IDX_DIM]` and `[pools][IDX_DIM]` f16).
 pub(super) enum Store38 {
@@ -93,11 +93,11 @@ pub(super) enum Store38 {
 }
 
 impl Store38 {
-    /// A zeroed delta store of [`LANES`] lanes, lane 0 stamped at position
-    /// 0 and every other never written.
+    /// A zeroed delta store of [`LANES`] lanes with a carry, lane 0 stamped
+    /// at position 0 and every other never written.
     pub(super) fn rec(stream: &CudaStream) -> Result<Store38, GpuError> {
         Ok(Store38::Rec {
-            rec: RecStore::new(stream, GDN.lens(LANES), LANES)?,
+            rec: RecStore::carried(stream, GDN.lens(LANES), LANES, GDN.carry_len())?,
             stamp: DeviceBuffer::from_host(stream, &fresh_stamps(LANES))?,
         })
     }
@@ -130,13 +130,22 @@ impl Store38 {
     }
 }
 
+/// The refusal of a delta store without the carry [`Store38::rec`] keeps.
+pub(super) fn no_carry() -> GpuError {
+    GpuError::state(
+        "qwen4exp delta store",
+        "a delta store's carry (`Store38::rec` keeps one)",
+    )
+}
+
 /// The bytes `runtime::stores` counts for a delta store of [`LANES`] lanes
 /// and for a selecting store at `ctx` positions: what the load's
 /// allocations must equal.
 pub(super) fn store_rule_bytes(ctx: usize) -> (u64, u64) {
     (
         stores::recurrent_bytes(GDN.n_v, GDN.n_k, linear::HEAD, linear::CONV_TAPS)
-            + stores::delta_lane_bytes(GDN.n_v, linear::HEAD, LANES),
+            + stores::delta_lane_bytes(GDN.n_v, linear::HEAD, LANES)
+            + stores::delta_carry_bytes(GDN.n_v, GDN.n_k, linear::HEAD),
         stores::selecting_bytes(geo::N_KV, geo::HEAD, geo::IDX_DIM, geo::POOL, ctx),
     )
 }
@@ -180,7 +189,7 @@ pub(super) struct Qsa38 {
     /// The normed and turned queries.
     pub(super) q: DeviceBuffer<f32>,
     /// The flash's partials, over a list's width: a pass's rows, none in a
-    /// ubatch walk's arena (its selected flash folds without them).
+    /// ubatch walk's arena (its listed prefill flash takes none).
     pub(super) part_v: DeviceBuffer<f32>,
     pub(super) part_ms: DeviceBuffer<f32>,
     /// The indexer's raw keys and queries, token-major.
@@ -221,7 +230,9 @@ pub(super) struct Arena38 {
     /// The mixer's rows before the output projection: the gated norm's, or
     /// the attention's under its gate.
     pub(super) attn: DeviceBuffer<f32>,
-    /// The flash's output.
+    /// The selected flash's output before its gate: a pass's rows, none in a
+    /// ubatch walk's arena (its prefill flash stores into `attn` under the
+    /// gate).
     pub(super) flash: DeviceBuffer<f32>,
     pub(super) gdn: Gdn38,
     pub(super) qsa: Qsa38,
@@ -262,8 +273,8 @@ impl Arena38 {
     /// A ubatch walk's arena for up to `rows` (1..=`most`) tokens over caches
     /// of `ctx` positions: every token-major buffer for `rows` tokens, the
     /// selection's scratch for a run of [`select_run`] rows (its selecting
-    /// rows run in runs of that many) and no selected-flash partials, the
-    /// router's buffers for [`ROUTE_ROWS`] (it routes in runs of that many).
+    /// rows run in runs of that many) and no selected-flash partials or
+    /// output, the router's buffers for [`ROUTE_ROWS`] (it routes in runs of that many).
     /// Load-time only.
     pub(super) fn wide(
         stream: &CudaStream,
@@ -279,11 +290,19 @@ impl Arena38 {
             ));
         }
         let route = RouterOut::for_ubatch(stream, router, rows.min(ROUTE_ROWS))?;
-        Arena38::alloc(stream, rows, (select_run(rows, ctx), 0), route, ctx)
+        let mut a = Arena38::alloc(stream, rows, (select_run(rows, ctx), 0), route, ctx)?;
+        // The prompt form's records take the q·k·v rows' room once the conv
+        // has read them (`wide38::gdn`); a short walk needs a little more
+        // than the rows.
+        let work = linear::delta::prompt_work_len(GDN, rows);
+        if a.gdn.x.len() < work {
+            a.gdn.x = DeviceBuffer::zeroed(stream, work)?;
+        }
+        Ok(a)
     }
 
     /// The buffers for `rows` tokens, the selection's for `sel` rows and the
-    /// selected flash's partials for `parts`, the router's `route`.
+    /// selected flash's partials and output for `parts`, the router's `route`.
     fn alloc(
         stream: &CudaStream,
         rows: usize,
@@ -308,7 +327,7 @@ impl Arena38 {
             y: f(h)?,
             hc: HcScratch::new(stream, geometry)?,
             attn: f(geo::ATTN)?,
-            flash: f(geo::ATTN)?,
+            flash: DeviceBuffer::zeroed(stream, parts * geo::ATTN)?,
             gdn: Gdn38 {
                 x: f(s.channels())?,
                 z: f(s.n_v * linear::HEAD)?,

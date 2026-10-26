@@ -22,15 +22,19 @@
 //! no kernel side. The host edits themselves are one-off edits recorded in the
 //! round that proves the clause.
 
-use bloomery_metal::library::SOURCE;
+#[path = "../shared/mutants.rs"]
+mod program;
 
-/// A defect and the clause that must be red on it.
-pub struct Mutant {
-    pub name: &'static str,
-    pub clause: &'static str,
-    pub why: &'static str,
-    /// `(find, replace, occurrences of find)`, applied in order.
-    pub edits: &'static [(&'static str, &'static str, usize)],
+pub use program::{Mutant, Program, source_of};
+
+/// Every mutant of both tables, with the program it edits.
+pub fn all() -> impl Iterator<Item = (&'static Mutant, Program)> {
+    program::all(MUTANTS, TENSOR_MUTANTS)
+}
+
+/// The mutant of this name, and the program it edits.
+pub fn find(name: &str) -> Option<(&'static Mutant, Program)> {
+    all().find(|(m, _)| m.name == name)
 }
 
 pub const MUTANTS: &[Mutant] = &[
@@ -145,22 +149,11 @@ pub const MUTANTS: &[Mutant] = &[
     },
 ];
 
-pub fn find(name: &str) -> Option<&'static Mutant> {
-    MUTANTS.iter().find(|m| m.name == name)
-}
-
-/// The kernels' source with the mutant's edits applied.
-pub fn source_of(mutant: &Mutant) -> Result<String, String> {
-    let mut text = SOURCE.to_string();
-    for (find, replace, count) in mutant.edits {
-        let found = text.matches(find).count();
-        if found != *count {
-            return Err(format!(
-                "mutant {}: {find:?} occurs {found} times, not {count}",
-                mutant.name
-            ));
-        }
-        text = text.replace(find, replace);
-    }
-    Ok(text)
-}
+/// The tensor-op GEMMs' defects `q_tensor` must catch: the program it forces
+/// is the one its pass runs.
+pub const TENSOR_MUTANTS: &[Mutant] = &[Mutant {
+    name: "tensor_pass_pair_swapped",
+    clause: "q_tensor",
+    why: "the routed pair's gate and up accumulators swap places in the tensor-op SwiGLU",
+    edits: &[("pair_swiglu(cg[i], cu[i])", "pair_swiglu(cu[i], cg[i])", 1)],
+}];

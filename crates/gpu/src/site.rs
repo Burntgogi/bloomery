@@ -1196,6 +1196,100 @@ pub fn resident_gemm(
     wide_by_name(gpu, k, (w, src, rows), x, route, m, y)
 }
 
+/// A resident gate projection followed by the shared sigmoid norm, its
+/// output `tail.y` then quantized for the resident sites `readers` into
+/// `out` ([`resident_quantize`]). BF16 and native W8A8 MXFP8 tensor-core
+/// sites finish the norm in their product's store epilogue. The MXFP8
+/// epilogue also writes the output's MXFP8 form, so it runs only when that
+/// form is all the readers take from `out` ([`only_form`]).
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the projection's operands, its norm tail and the output's readers"
+)]
+pub(crate) fn resident_gemm_norm_gate(
+    gpu: &Gpu,
+    k: &WideKernels<'_>,
+    (w, name): (&Weights, &str),
+    x: &WideIn<'_>,
+    route: &GemmRoute,
+    m: usize,
+    (norm, z, tail): (
+        &crate::linear::norm_gate::NormGateKernels,
+        &mut DeviceBuffer<f32>,
+        crate::linear::norm_gate::NormGateTail<'_>,
+    ),
+    (readers, out): (&[&str], &mut GemmAct32),
+) -> Result<(), GpuError> {
+    use crate::linear::norm_gate::{NormGateArgs, NormGateTail};
+    let what = "site::resident_gemm_norm_gate";
+    let weight = w.resident(what, name)?;
+    let rows = weight.rows();
+    let NormGateTail {
+        o,
+        w: gain,
+        eps,
+        fault,
+        y,
+    } = tail;
+    let tail = NormGateTail {
+        o,
+        w: gain,
+        eps,
+        fault,
+        y: &mut *y,
+    };
+    let mxfp8 = match weight {
+        DevWeight::Mxfp8 { .. } => Some(w.e4m3(what, name)?),
+        _ => None,
+    };
+    match (weight, mxfp8, x.q32, x.f32) {
+        (DevWeight::Bf16 { w: packed, .. }, _, Some(act), Some(input))
+            if gpu.q8f32().dense_mma && act.holds(MmaForm::Bf16, input, m) =>
+        {
+            k.g32(what, "the BF16 prompt kernels")?
+                .enqueue_bf16_mma_norm_gate(gpu.stream(), packed, input, act, m, z, tail)?;
+        }
+        (_, Some(planes), Some(act), Some(input))
+            if gpu.q8f32().dense_mma
+                && only_form(gpu, w, readers, out) == Some(MmaForm::Mxfp8)
+                && crate::gemm::mxfp8_w8a8_reads(&planes, act, input, m) =>
+        {
+            return k
+                .g32(what, "the MXFP8 prompt kernels")?
+                .enqueue_mxfp8_w8a8_norm_gate(
+                    gpu.stream(),
+                    crate::gemm::Mxfp8NormGateArgs {
+                        w: planes,
+                        x: input,
+                        act,
+                        n_cols: m,
+                        z,
+                        tail,
+                        out,
+                    },
+                );
+        }
+        _ => {
+            tail.check_rows(what, rows, m, z.len())?;
+            resident_gemm(gpu, k, (w, name), x, route, m, z)?;
+            norm.enqueue_norm_gate_sigmoid(
+                gpu.stream(),
+                NormGateArgs {
+                    o,
+                    z,
+                    w: gain,
+                    eps,
+                    n_v: rows / crate::linear::HEAD,
+                    m,
+                    fault,
+                    y: tail.y,
+                },
+            )?;
+        }
+    }
+    resident_quantize(gpu, k, (w, readers), (&*y, m), out, fault)
+}
+
 /// [`resident_gemm`] over rows `at .. at + n` of the resident weight `name`
 /// alone ([`SiteWeight::Part`]), their `n` outputs of each slot token-major
 /// into `y`, each bit for bit the whole weight's for its row and slot.
@@ -1265,12 +1359,7 @@ pub fn resident_quantize(
     q32: &mut GemmAct32,
     sink: FaultSink,
 ) -> Result<(), GpuError> {
-    let reads_q32 = |n: &&str| {
-        w.get(n)
-            .and_then(of_resident)
-            .is_some_and(|ty| WideActs::wants(ty).q32)
-    };
-    if names.iter().any(reads_q32) {
+    if reads_q32(w, names) {
         k.g32(
             "site::resident_quantize",
             "the 32-value kernels a site's q8 blocks of 32 are quantized by",
@@ -1282,9 +1371,41 @@ pub fn resident_quantize(
     })
 }
 
+/// The one [`MmaForm`] the sites of the resident weights `readers` take
+/// from `act`, when it is all they take: a reader copies it
+/// ([`reads_form`]), and none reads the q8 blocks of 32 or another form
+/// `act` holds room for. An epilogue that writes this form beside its f32
+/// rows leaves the readers nothing to quantize.
+#[must_use]
+pub(crate) fn only_form(
+    gpu: &Gpu,
+    w: &Weights,
+    readers: &[&str],
+    act: &GemmAct32,
+) -> Option<MmaForm> {
+    if reads_q32(w, readers) {
+        return None;
+    }
+    let mut read = [MmaForm::Bf16, MmaForm::Mxfp8]
+        .into_iter()
+        .filter(|&f| act.has(f) && reads_form(gpu, w, readers, f));
+    let form = read.next()?;
+    read.next().is_none().then_some(form)
+}
+
+/// Whether a site of one of the resident weights `names` reads the q8
+/// blocks of 32 ([`WideActs::wants`] of its resident type).
+fn reads_q32(w: &Weights, names: &[&str]) -> bool {
+    names.iter().any(|n| {
+        w.get(n)
+            .and_then(of_resident)
+            .is_some_and(|ty| WideActs::wants(ty).q32)
+    })
+}
+
 /// Each form `q32` holds room for of the first `m` columns of the f32 rows
-/// `x`: written (`enqueue_bf16_cols`, `enqueue_mxfp8_cols`) when a site reads
-/// it (`reads`), else marked as another rows'.
+/// `x`: written (`enqueue_form_cols`) when a site reads it (`reads`), else
+/// marked as another rows'.
 fn write_forms(
     k: &WideKernels<'_>,
     stream: &cuda_core::CudaStream,
@@ -1300,14 +1421,11 @@ fn write_forms(
             q32.forget(form);
             continue;
         }
-        let g32 = k.g32(
+        k.g32(
             "site::write_forms",
             "the 32-value kernels a site's MMA form is written by",
-        )?;
-        match form {
-            MmaForm::Bf16 => g32.enqueue_bf16_cols(stream, x, m, q32)?,
-            MmaForm::Mxfp8 => g32.enqueue_mxfp8_cols(stream, x, m, q32)?,
-        }
+        )?
+        .enqueue_form_cols(stream, form, x, m, q32)?;
     }
     Ok(())
 }

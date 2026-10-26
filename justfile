@@ -1600,7 +1600,7 @@ gate-gpu-qwen3moe-head:
 # fault·거부·그래프 재생 포함. ARGS는 `--case <부분문자열>` 필터. `--bench-kernels`는 판정 대신 런치 값을 잰다
 # (리드 전용, `bench-gpu-kernels`). relu² 접힌 32값 블록 양자화기(`g32_relu_sqr`)는 relu_sqr 다음 quantize_gemm32와 비트 동일.
 gate-gpu-gemm *ARGS:
-    ./tools/box.sh 'bash tools/gate.sh --oxide --release -p bloomery-gpu-gates --features gpu --bin gate_gemm -- workers_must_complete kquant_contract_keeps_a_subnormal_step_exact'
+    ./tools/box.sh 'bash tools/gate.sh --oxide --release -p bloomery-gpu-gates --features gpu --bin gate_gemm -- workers_must_complete kquant_contract_keeps_a_subnormal_step_exact nan_bits_equal_takes_the_length_and_any_nan'
     BLOOMERY_MODEL=qwen3moe ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_gemm && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_gemm {{ARGS}}'
 
 # 선형 어텐션(Gated DeltaNet) 카드 커널 셋 — conv+준비, delta 스텝, 게이트 노름 — 을 호스트 규칙과 비트로 맞춘다.
@@ -1770,7 +1770,13 @@ gate-gpu-flint-router:
 
 # Full-file eager/captured, resident-slot and ring-retention consumer transitions.
 gate-gpu-flint-lib:
-    ./tools/box.sh 'bash tools/gate.sh --gpu --oxide --release -p bloomery-gpu-flint --lib -- --include-ignored'
+    ./tools/box.sh 'bash tools/ref/real-only.sh gate-gpu-flint-lib && bash tools/gate.sh --gpu --oxide --release -p bloomery-gpu-flint --lib -- --include-ignored --exact tests::hw_full_file_capture_slots_reset_and_ring_boundary'
+
+# Real two-card top-six prompt/decode, union reference, capture and tier fault recovery.
+[group('solo')]
+[group('v41-load')]
+gate-gpu-flint-twocard:
+    BLOOMERY_CARD=both ./tools/box.sh 'bash tools/ref/real-only.sh gate-gpu-flint-twocard && export BLOOMERY_GATE_V41_LOAD=1 && bash tools/gate.sh --gpu --oxide --release -p bloomery-gpu-flint --lib -- --include-ignored --exact two_card_tests::hw_two_card_full_file_union_capture_publication_fault_reset'
 
 # Muse Spark's 256-expert top-8 sigmoid router (`sigmoid_256_8`). Model-free like the Flint one,
 # plus the bias clause: the selection follows the biased scores, the weights the unbiased ones.

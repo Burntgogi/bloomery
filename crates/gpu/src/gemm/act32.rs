@@ -154,6 +154,63 @@ impl GemmAct32 {
             .filter(|f| f.of.is_some_and(|(at, m)| at == x.cu_deviceptr() && n <= m))
     }
 
+    /// `form`'s room for the first `n` columns of `k` values, as `what`'s: a
+    /// scratch of another K or fewer columns is a named `Shape` error, one
+    /// made without room for `form` a named `State` error.
+    pub(super) fn room(
+        &mut self,
+        what: &'static str,
+        form: MmaForm,
+        k: usize,
+        n: usize,
+    ) -> Result<&mut ColsForm, GpuError> {
+        if k != self.k {
+            return Err(GpuError::shape(
+                what,
+                format!("the scratch holds columns of {} values, not {k}", self.k),
+            ));
+        }
+        if n == 0 || n > self.cols {
+            return Err(GpuError::shape(
+                what,
+                format!("1 <= n_cols <= act.cols() = {}, got {n}", self.cols),
+            ));
+        }
+        self.forms[form as usize]
+            .as_mut()
+            .ok_or_else(|| GpuError::state(what, "a scratch made with_form for this form"))
+    }
+
+    /// `form`'s words, scale words and refusal words for an epilogue that
+    /// writes it of the first `n` columns of `k` values ([`Self::room`]'s
+    /// checks, as `what`'s), the refusal words zeroed on `stream` for the
+    /// epilogue's pieces to OR. The form holds no rows' until
+    /// [`Self::wrote`] marks it after the launch.
+    pub(crate) fn out_planes(
+        &mut self,
+        stream: &CudaStream,
+        what: &'static str,
+        form: MmaForm,
+        (k, n): (usize, usize),
+    ) -> Result<[&mut DeviceBuffer<u32>; 3], GpuError> {
+        let f = self.room(what, form, k, n)?;
+        f.of = None;
+        f.refused.zero_async(stream)?;
+        Ok([&mut f.words, &mut f.scales, &mut f.refused])
+    }
+
+    /// Marks `form` as an epilogue's of the first `n` columns of the f32 rows
+    /// at device address `at`, and the other form as another rows'.
+    pub(crate) fn wrote(&mut self, form: MmaForm, at: u64, n: usize) {
+        if let Some(f) = &mut self.forms[form as usize] {
+            f.of = Some((at, n));
+        }
+        self.forget(match form {
+            MmaForm::Bf16 => MmaForm::Mxfp8,
+            MmaForm::Mxfp8 => MmaForm::Bf16,
+        });
+    }
+
     /// Whether a site can read `form` of the first `n` columns of `x`
     /// ([`GemmAct32::form_of`]).
     #[must_use]
@@ -315,29 +372,19 @@ fn form_launch<'a>(
     act: &'a mut GemmAct32,
     form: MmaForm,
 ) -> Result<(LaunchConfig1D, u32, u32, &'a mut ColsForm), GpuError> {
-    if n_cols == 0 || n_cols > act.cols {
+    let k_values = act.k;
+    let f = act.room(what, form, k_values, n_cols)?;
+    if x.len() < n_cols * k_values {
         return Err(GpuError::shape(
             what,
-            format!("1 <= n_cols <= act.cols() = {}, got {n_cols}", act.cols),
-        ));
-    }
-    if x.len() < n_cols * act.k {
-        return Err(GpuError::shape(
-            what,
-            format!("x.len() {} < n_cols*k = {n_cols}*{}", x.len(), act.k),
+            format!("x.len() {} < n_cols*k = {n_cols}*{k_values}", x.len()),
         ));
     }
     crate::tensor::check_alignment::<U32x4, _>(what, "x", x)?;
-    let k = launch_u32(what, "k", act.k)?;
+    let k = launch_u32(what, "k", k_values)?;
     let n = launch_u32(what, "n_cols", n_cols)?;
     let warps = (FORM_THREADS / 32) as usize;
     let grid = launch_u32(what, "grid", n_cols.div_ceil(warps))?;
-    let Some(f) = &mut act.forms[form as usize] else {
-        return Err(GpuError::state(
-            what,
-            "a scratch made with_form for this form",
-        ));
-    };
     Ok((LaunchConfig1D::new(grid, FORM_THREADS, 0), k, n, f))
 }
 
@@ -392,6 +439,22 @@ impl Gemm32Kernels {
         }
         #[cfg(not(bloomery_nvfp4_mma))]
         Err(GpuError::state(what, NATIVE_BUILD))
+    }
+
+    /// Enqueue `form` of the first `n_cols` columns of `x` into `act`:
+    /// [`Self::enqueue_bf16_cols`] or [`Self::enqueue_mxfp8_cols`].
+    pub fn enqueue_form_cols(
+        &self,
+        stream: &CudaStream,
+        form: MmaForm,
+        x: &DeviceBuffer<f32>,
+        n_cols: usize,
+        act: &mut GemmAct32,
+    ) -> Result<(), GpuError> {
+        match form {
+            MmaForm::Bf16 => self.enqueue_bf16_cols(stream, x, n_cols, act),
+            MmaForm::Mxfp8 => self.enqueue_mxfp8_cols(stream, x, n_cols, act),
+        }
     }
 
     /// Enqueue the 32-value quantization of the first `n_cols` columns of `x`
@@ -497,8 +560,18 @@ impl Gemm32Kernels {
         }
         #[cfg(bloomery_nvfp4_mma)]
         if act.native.is_some() {
-            self.native
-                .swiglu(stream, g, u, None, Act::SiluMul, m, act, fault)?;
+            self.native.swiglu(
+                stream,
+                super::nvfp4mma::SwigluArgs {
+                    g,
+                    u,
+                    selected: None,
+                    rule: Act::SiluMul,
+                    cols: m,
+                    act,
+                },
+                fault,
+            )?;
             act.fill(n_cols);
             return Ok(());
         }
@@ -555,8 +628,18 @@ impl Gemm32Kernels {
         let (code, limit) = rule.code(what)?;
         #[cfg(bloomery_nvfp4_mma)]
         if act.native.is_some() {
-            self.native
-                .swiglu(stream, g, u, None, rule, m, act, fault)?;
+            self.native.swiglu(
+                stream,
+                super::nvfp4mma::SwigluArgs {
+                    g,
+                    u,
+                    selected: None,
+                    rule,
+                    cols: m,
+                    act,
+                },
+                fault,
+            )?;
             act.fill(n_cols);
             return Ok(());
         }
@@ -622,12 +705,14 @@ impl Gemm32Kernels {
         if act.native.is_some() {
             self.native.swiglu(
                 stream,
-                g,
-                u,
-                Some((sel, n_card)),
-                Act::SiluMul,
-                m,
-                act,
+                super::nvfp4mma::SwigluArgs {
+                    g,
+                    u,
+                    selected: Some((sel, n_card)),
+                    rule: Act::SiluMul,
+                    cols: m,
+                    act,
+                },
                 fault,
             )?;
             act.fill(n_cols);

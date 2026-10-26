@@ -47,12 +47,18 @@
 //! range is recomputed by the exact F32 owner, in its exponent range and
 //! reduction order; every other cell keeps its MMA value, so a cell's bits
 //! depend on its own row and column alone. The exact tile entries stay
-//! available.
+//! available. A narrow block ([`bf16_mma_narrow`]: sixteen rows of a BF16
+//! weight against up to eight columns, one fragment) runs the same
+//! arithmetic, so its cells are the tile's bits; a decode launch that must
+//! match a prompt launch per token uses it.
 
 use super::act32::ColsForm;
 use super::gemm32::{GEMM32_GROUP, raster32};
 use super::kernels32::Gemm32Kernels;
 use super::{GemmAct32, MmaForm};
+use crate::fault::FaultSink;
+use crate::linear::norm_gate::{NormGateTail, norm_gate_values};
+use crate::linear::{GATE_SIGMOID, HEAD};
 use crate::q8f32::{Bf16Words, ByteBlocks, E4m3Scales, E4m3Weight};
 use crate::tensor::DeviceTensor;
 use crate::{GpuError, launch_u32};
@@ -894,7 +900,7 @@ pub(crate) unsafe fn bf16_cols_body(
 
 /// The column a form block's warp writes: block `b`'s warp `w`, `8b + w`.
 #[inline(always)]
-pub(super) fn form_col() -> usize {
+pub(crate) fn form_col() -> usize {
     thread::blockIdx_x() as usize * (FORM_THREADS as usize / 32)
         + thread::threadIdx_x() as usize / 32
 }
@@ -906,7 +912,7 @@ pub(super) fn form_col() -> usize {
 ///
 /// `refused` holds `n` words, and `c` is this warp's column.
 #[inline(always)]
-pub(super) unsafe fn store_refused(
+pub(crate) unsafe fn store_refused(
     refused: &mut DisjointSlice<u32>,
     c: usize,
     n: usize,
@@ -954,15 +960,22 @@ pub(crate) struct MmaTile {
     bad: u64,
 }
 
+/// Row and column of value `i` (< 4) of an m16n8 accumulator fragment in
+/// lane `lane`, at the fragment's origin `(r0, c0)`.
+#[inline(always)]
+fn fragment_cell((r0, c0): (usize, usize), lane: usize, i: usize) -> (usize, usize) {
+    (
+        r0 + lane / MMA_ROW_LANES + (i / 2) * 8,
+        c0 + 2 * (lane % MMA_ROW_LANES) + i % 2,
+    )
+}
+
 impl MmaTile {
     #[inline(always)]
     pub(crate) fn coordinates(&self, cell: usize) -> (usize, usize) {
         let (mi, j, i) = (cell / 16, (cell / 4) % 4, cell % 4);
         let (r0, c0) = self.warp_origin();
-        (
-            r0 + mi * 16 + self.lane / MMA_ROW_LANES + (i / 2) * 8,
-            c0 + j * 8 + 2 * (self.lane % MMA_ROW_LANES) + i % 2,
-        )
+        fragment_cell((r0 + mi * 16, c0 + j * 8), self.lane, i)
     }
 
     /// The accumulated value of `cell` (< [`MMA_CELLS`]). Cells
@@ -1399,6 +1412,476 @@ pub(crate) unsafe fn bf16_mma_body<W: MmaRows, X: MmaCols>(
     }
 }
 
+/// Rows of a narrow MMA block ([`bf16_mma_narrow`]): one m16 fragment.
+pub(crate) const NARROW_ROWS: usize = 16;
+/// Columns of a narrow MMA block: one n8 fragment.
+pub(crate) const NARROW_COLS: usize = 8;
+/// 32-value chunks of every row and column one narrow stage holds.
+const NARROW_CHUNKS: usize = 4;
+/// Narrow stages in shared memory: the one warp 0 reads and three being
+/// copied in.
+const NARROW_STAGES: usize = 4;
+/// Words of a narrow stage's rows: per chunk, [`NARROW_ROWS`] lines laid out
+/// as the tile's ([`mma_piece_at`]).
+const NARROW_ROW_WORDS: usize = NARROW_CHUNKS * NARROW_ROWS * MMA_LINE_WORDS;
+/// f32 values from one column of a narrow stage to the next: the stage's
+/// values and eight more, so the eight columns one fragment read takes fall
+/// in two rounds of the 32 banks.
+const NARROW_COL_PITCH: usize = NARROW_CHUNKS * 32 + 8;
+/// Words of one narrow stage: the rows' BF16 lines, then the columns' f32
+/// values.
+const NARROW_STAGE_WORDS: usize = NARROW_ROW_WORDS + NARROW_COLS * NARROW_COL_PITCH;
+/// Shared words a narrow block takes.
+pub(crate) const NARROW_WORDS: usize = NARROW_STAGES * NARROW_STAGE_WORDS;
+// Each thread copies one 16-byte piece of the rows and one of the columns a
+// stage; the pipeline's wait leaves the two newest stages' groups pending.
+const _: () = assert!(NARROW_CHUNKS * NARROW_ROWS * MMA_PIECES == MMA_THREADS as usize);
+const _: () = assert!(NARROW_COLS * NARROW_CHUNKS * 8 == MMA_THREADS as usize);
+const _: () = assert!(NARROW_STAGES == 4 && NARROW_ROWS == 16 && NARROW_COLS == 8);
+// Stages and column lines start 16-byte aligned.
+const _: () = assert!(
+    NARROW_ROW_WORDS.is_multiple_of(4)
+        && NARROW_COL_PITCH.is_multiple_of(4)
+        && NARROW_STAGE_WORDS.is_multiple_of(4)
+);
+
+/// Warp 0's fragment of a narrow block ([`bf16_mma_narrow`]), and the cells
+/// of the block the exact owner replays: those whose row or column held an
+/// operand [`mma_fits`] refuses, the cells [`MmaTile::needs_replay`] marks.
+pub(crate) struct NarrowTile {
+    values: [f32; 4],
+    lane: usize,
+    /// Bit `i` (`16 + c`): row offset `i` (column `c`) held an operand
+    /// [`mma_fits`] refuses. The same in every thread of the block.
+    refused: u32,
+}
+
+impl NarrowTile {
+    /// Whether the exact owner replays the cell at row offset `r` and column
+    /// `c`.
+    #[inline(always)]
+    pub(crate) fn replays(&self, r: usize, c: usize) -> bool {
+        self.refused & (1 << r | 1 << (16 + c)) != 0
+    }
+
+    /// Whether the exact owner replays a cell of row offset `r` among the
+    /// first `n` columns.
+    #[inline(always)]
+    pub(crate) fn replays_row(&self, r: usize, n: usize) -> bool {
+        self.refused & (1 << r | ((1 << n) - 1) << 16) != 0
+    }
+
+    /// Warp 0 stores the cells it keeps of the rows `row0 + r` below `rows`
+    /// and of the first `n` columns, at `y[c · rows + row0 + r]`.
+    ///
+    /// # Safety
+    /// Warp 0 of the block calls it; `y` holds `rows · n` outputs, and no other
+    /// block writes rows `row0 .. row0 + NARROW_ROWS`.
+    #[inline(always)]
+    #[allow(
+        clippy::needless_range_loop,
+        reason = "a range `for` is the loop the unroller recognizes; an iterator loop keeps its array in a local depot"
+    )]
+    pub(crate) unsafe fn store(
+        &self,
+        y: &mut DisjointSlice<f32>,
+        (rows, n): (usize, usize),
+        row0: usize,
+    ) {
+        for i in 0..4 {
+            thread::__unroll_config::<0>();
+            let (r, c) = fragment_cell((0, 0), self.lane, i);
+            if row0 + r < rows && c < n && !self.replays(r, c) {
+                // SAFETY: row row0 + r < rows and column c < n lie inside y;
+                // this lane holds the fragment's only copy of the cell.
+                unsafe { *y.get_unchecked_mut(c * rows + row0 + r) = self.values[i] };
+            }
+        }
+    }
+}
+
+/// The dense MMA tile's products ([`bf16_mma_tile`]) of a narrow block: rows
+/// `row0 .. row0 + NARROW_ROWS` of a BF16 weight's words against the first
+/// `n` f32 columns of `x`, each output the tile's bits for its row and
+/// column. The operands are what the tile stages (the weight's words as they
+/// are, each activation rounded to BF16 by `cvt.rn`), and the fragment runs
+/// one m16n8k16 chain from zero over K's 16-value steps in increasing order,
+/// as each of the tile's fragments does. Every thread of the block copies
+/// one row piece and one column piece of each stage with `cp.async`,
+/// [`NARROW_STAGES`] deep, a row past the last copied as the last; warp 0
+/// reads the rows with `ldmatrix` and its columns from their f32 lines, a
+/// column past the last read as the last. Returns warp 0's fragment and, in
+/// every thread, the rows and columns that held an operand [`mma_fits`]
+/// refuses.
+///
+/// # Safety
+///
+/// All 256 threads call converged. `rows >= 1`, `row0 < rows`, `1 <= n <=
+/// NARROW_COLS`, `k` a positive multiple of 32; `w` holds `rows · k / 2`
+/// words and `x` `n · k` values, both 16-byte aligned; `sh` is the block's
+/// own [`NARROW_WORDS`] shared words, 16-byte aligned.
+#[inline(always)]
+pub(crate) unsafe fn bf16_mma_narrow(
+    w: &[u32],
+    x: &[f32],
+    (rows, k, n): (usize, usize, usize),
+    row0: usize,
+    sh: *mut u32,
+) -> NarrowTile {
+    let tid = thread::threadIdx_x() as usize;
+    let lane = warp::lane_id() as usize;
+    let chunks = k / 32;
+    let stages = chunks.div_ceil(NARROW_CHUNKS);
+    // This thread's row piece: slot `rs` of line `rl` of chunk `rc` of each
+    // stage. And its column piece: values `xv .. xv + 4` of column `xc`'s
+    // stage values.
+    let (rc, rl, rs) = (
+        tid / (NARROW_ROWS * MMA_PIECES),
+        (tid / MMA_PIECES) % NARROW_ROWS,
+        tid % MMA_PIECES,
+    );
+    let r_src = (row0 + rl).min(rows - 1) * (k / 2) + rc * MMA_LINE_WORDS + 4 * rs;
+    let r_dst = rc * NARROW_ROWS * MMA_LINE_WORDS + mma_piece_at(rl, rs);
+    let (xc, xv) = (tid / (NARROW_CHUNKS * 8), 4 * (tid % (NARROW_CHUNKS * 8)));
+    let x_src = xc * k + xv;
+    let x_dst = NARROW_ROW_WORDS + xc * NARROW_COL_PITCH + xv;
+    let copy = |s: usize| {
+        let stage = sh.wrapping_add((s % NARROW_STAGES) * NARROW_STAGE_WORDS);
+        if s * NARROW_CHUNKS + rc < chunks {
+            // SAFETY: the row's chunk lies inside w (a live chunk of a row
+            // below rows), 16-byte aligned (k / 2 a multiple of 16 words, w
+            // aligned); the destination is this thread's own aligned piece of
+            // the stage, which no warp reads before the wait and barrier that
+            // complete it.
+            unsafe {
+                cp_async_cg_16(
+                    stage.wrapping_add(r_dst),
+                    w.as_ptr().add(r_src + s * NARROW_CHUNKS * MMA_LINE_WORDS),
+                )
+            };
+        }
+        if xc < n && s * NARROW_CHUNKS + xv / 32 < chunks {
+            // SAFETY: the four values lie in live column xc inside x, 16-byte
+            // aligned (k a multiple of 32, x aligned); the destination is this
+            // thread's own 16-byte aligned piece of the stage, which no warp
+            // reads before the wait and barrier that complete it.
+            unsafe {
+                cp_async_cg_16(
+                    stage.wrapping_add(x_dst),
+                    x.as_ptr().add(x_src + s * NARROW_CHUNKS * 32).cast::<u32>(),
+                )
+            };
+        }
+    };
+    for s in 0..NARROW_STAGES - 1 {
+        if s < stages {
+            copy(s);
+        }
+        // SAFETY: commits this thread's copies of stage s as one group,
+        // empty past the last stage.
+        unsafe { cp_async_commit_group() };
+    }
+
+    let warp0 = tid < 32;
+    let (g, t) = (lane / MMA_ROW_LANES, lane % MMA_ROW_LANES);
+    let a_lane = mma_piece_at(lane % 16, lane / 16);
+    let col = g.min(n - 1);
+    // SAFETY: sh is this block's shared allocation (this fn's contract).
+    let shared = unsafe { cvta_generic_to_shared_u32(sh.cast_const().cast::<u8>()) };
+    let mut acc = [0.0f32; 4];
+    // Bit 0 (1): a value of row g (g + 8) failed mma_fits; bit 2: a value of
+    // column `col`.
+    let mut bad = 0u32;
+    for s in 0..stages {
+        // SAFETY: NARROW_STAGES − 1 groups precede the loop and one each
+        // pass, so leaving the two newest pending completes stage s's. The
+        // barrier then publishes every thread's copies of it, and tells that
+        // warp 0 is done reading stage s − 1, whose buffer the copy below
+        // refills.
+        unsafe { cp_async_wait_group(2) };
+        thread::sync_threads();
+        if s + NARROW_STAGES - 1 < stages {
+            copy(s + NARROW_STAGES - 1);
+        }
+        // SAFETY: one group per pass, empty near the end.
+        unsafe { cp_async_commit_group() };
+        if warp0 {
+            let buf = (s % NARROW_STAGES) * NARROW_STAGE_WORDS;
+            let rows_at = shared + (4 * buf) as u32;
+            let cols = sh
+                .wrapping_add(buf + NARROW_ROW_WORDS + col * NARROW_COL_PITCH + 2 * t)
+                .cast::<F32x2>();
+            for c in 0..NARROW_CHUNKS {
+                thread::__unroll_config::<0>();
+                if s * NARROW_CHUNKS + c < chunks {
+                    for step in 0..2 {
+                        thread::__unroll_config::<0>();
+                        let at = c * NARROW_ROWS * MMA_LINE_WORDS + (a_lane ^ (8 * step));
+                        // SAFETY: the warp is converged; each lane's 16-byte
+                        // row lies in this published stage's row lines.
+                        let a = unsafe { ldmatrix_x4_shared_u32(rows_at + (4 * at) as u32) };
+                        let xp = cols.wrapping_add(16 * c + 8 * step);
+                        // SAFETY: values 2t and 2t + 1 of the step's first
+                        // eight of column `col`, 8-byte aligned, published by
+                        // the barrier.
+                        let F32x2([x0, x1]) = unsafe { *xp };
+                        // SAFETY: values 8 + 2t and 9 + 2t of the step's sixteen of column
+                        // `col`, 8-byte aligned, published by the barrier.
+                        let F32x2([x2, x3]) = unsafe { *xp.add(4) };
+                        bad |= u32::from(!(mma_fits_bf16x2(a[0]) & mma_fits_bf16x2(a[2])));
+                        bad |= u32::from(!(mma_fits_bf16x2(a[1]) & mma_fits_bf16x2(a[3]))) << 1;
+                        let fits = mma_fits(x0) & mma_fits(x1) & mma_fits(x2) & mma_fits(x3);
+                        bad |= u32::from(!fits) << 2;
+                        let b = [cvt_bf16x2_f32(x0, x1), cvt_bf16x2_f32(x2, x3)];
+                        // SAFETY: the whole warp is converged; A is row-major
+                        // and B column-major in the m16n8k16 fragment layout.
+                        acc = unsafe { mma_m16n8k16_f32_bf16(acc, a, b) };
+                    }
+                }
+            }
+        }
+    }
+
+    // The votes go through the stage the pipeline left unread: the copies
+    // still pending are empty, and warp 0 last read another buffer.
+    let flag = sh.wrapping_add((stages % NARROW_STAGES) * NARROW_STAGE_WORDS);
+    if warp0 {
+        let (lo, hi, cols) = (
+            warp::ballot(bad & 1 != 0),
+            warp::ballot(bad & 2 != 0),
+            warp::ballot(bad & 4 != 0),
+        );
+        if lane == 0 {
+            // Lanes 4g .. 4g + 3 hold row g's, row g + 8's and column g's votes.
+            let quad = |v: u32, g: usize| u32::from((v >> (MMA_ROW_LANES * g)) & 0xf != 0);
+            let mut refused = 0u32;
+            for g in 0..8 {
+                thread::__unroll_config::<0>();
+                refused |= quad(lo, g) << g | quad(hi, g) << (8 + g) | quad(cols, g) << (16 + g);
+            }
+            // SAFETY: lane 0 of warp 0 is the vote word's only writer.
+            unsafe { *flag = refused };
+        }
+    }
+    thread::sync_threads();
+    // SAFETY: the barrier published the vote word.
+    let refused = unsafe { *flag };
+    NarrowTile {
+        values: acc,
+        lane,
+        refused,
+    }
+}
+
+/// What an epilogue writes of its output columns beside their f32 values
+/// (a norm gate's [`bf16_mma_norm_gate_body`], the HC mix's
+/// `hc_gated::up_mma_mix_body`): nothing, or the MMA form the next site
+/// reads ([`Bf16Out`], `nvfp4mma.rs`'s `Mxfp8Out`), each column's refusal
+/// word zero before the launch and ORed by its pieces.
+pub(crate) trait OutForm: Copy {
+    /// Whether the epilogue writes anything.
+    const WRITES: bool;
+
+    /// Writes the form of the `N` 32-value blocks (`N` 1 or 4) of column `c`
+    /// from row `row0`, `k` values a column, that one warp holds: lane `l`'s
+    /// `v[i]` is row `row0 + l + 32·i`'s, `row0` a multiple of `32·N`.
+    ///
+    /// # Safety
+    ///
+    /// The whole warp calls converged on a live column the form holds room
+    /// for, and the blocks lie inside its `k` values.
+    unsafe fn store<const N: usize>(self, v: [f32; N], c: usize, row0: usize, k: usize);
+}
+
+impl OutForm for () {
+    const WRITES: bool = false;
+
+    #[inline(always)]
+    unsafe fn store<const N: usize>(self, _: [f32; N], _: usize, _: usize, _: usize) {}
+}
+
+/// [`Bf16Cols`]' words and refusal words of an epilogue's output columns,
+/// with [`bf16_cols_body`]'s bits: each value rounded to nearest even, the
+/// even lane of a pair writing their word.
+#[derive(Clone, Copy)]
+pub(crate) struct Bf16Out {
+    pub(crate) words: *mut u32,
+    pub(crate) refused: *mut u32,
+}
+
+impl OutForm for Bf16Out {
+    const WRITES: bool = true;
+
+    #[inline(always)]
+    #[allow(clippy::needless_range_loop, reason = "indexed CUDA-unrolled arrays")]
+    unsafe fn store<const N: usize>(self, v: [f32; N], c: usize, row0: usize, k: usize) {
+        let mut fits = true;
+        for i in 0..N {
+            thread::__unroll_config::<0>();
+            // SAFETY: rows row0 + 32i .. + 32 lie in the blocks (this fn's
+            // contract).
+            fits &= unsafe { self.pair(v[i], c * k + row0 + 32 * i) };
+        }
+        // SAFETY: c is a live column the form holds (this fn's contract).
+        unsafe { refuse_or(self.refused, c, fits) };
+    }
+}
+
+impl Bf16Out {
+    /// Writes the words of the 32 values from value `at` (a multiple of 32)
+    /// that lane `l`'s `v` is value `at + l` of; whether `v` fits.
+    ///
+    /// # Safety
+    ///
+    /// The whole warp calls converged, and the 16 words lie inside the form.
+    #[inline(always)]
+    unsafe fn pair(self, v: f32, at: usize) -> bool {
+        let lane = warp::lane_id() as usize;
+        let word = cvt_bf16x2_f32(v, warp::shuffle_xor_f32(v, 1));
+        if lane.is_multiple_of(2) {
+            // SAFETY: word (at + lane) / 2 is this even lane's own (this fn's
+            // contract).
+            unsafe { *self.words.add((at + lane) / 2) = word };
+        }
+        mma_fits(v)
+    }
+}
+
+/// ORs 1 into column `c`'s refusal word when a lane of the warp saw a value
+/// [`mma_fits`] refuses (`fits` false). Every lane of the warp calls it.
+///
+/// # Safety
+///
+/// `refused` holds a live word for column `c`, which this launch only ORs.
+#[inline(always)]
+pub(crate) unsafe fn refuse_or(refused: *mut u32, c: usize, fits: bool) {
+    use cuda_device::atomic::{AtomicOrdering, DeviceAtomicU32};
+    if warp::any(!fits) && warp::lane_id() == 0 {
+        // SAFETY: word c is live and 4-byte aligned (this fn's contract); the
+        // launch only ORs it atomically.
+        let word = unsafe { DeviceAtomicU32::from_ptr(refused.add(c)) };
+        word.fetch_or(1, AtomicOrdering::Relaxed);
+    }
+}
+
+/// Dense prompt product ([`bf16_mma_body`]'s, BF16 or block-scaled E4M3)
+/// followed by the shared sigmoid norm, its output also in `form`. Normal
+/// tiles exchange z through the retired staging allocation; exceptional
+/// tiles finish through the exact product owner first. K counts values; a
+/// scaled tile's units are value pairs.
+///
+/// # Safety
+///
+/// A block has 256 converged threads and the MMA raster's grid. rows is a
+/// positive multiple of HEAD, n is positive and k a positive multiple of 64
+/// (128 for a scaled tile). w and x meet [`bf16_mma_tile`]'s contract for
+/// rows*k weight values and n*k activations; x.exact holds n*k values. o, z
+/// and y hold rows*n values, gain holds HEAD. sh is this block's
+/// 16-byte-aligned allocation of STAGES*STAGE_FLOATS floats. Output and
+/// scratch cells belong to this block; `form` holds room for the n columns
+/// of rows values.
+#[inline(always)]
+#[allow(
+    clippy::too_many_arguments,
+    clippy::needless_range_loop,
+    reason = "flat device operands and indexed CUDA-unrolled arrays"
+)]
+pub(crate) unsafe fn bf16_mma_norm_gate_body<W: MmaRows, X: MmaCols, F: OutForm>(
+    w: W,
+    x: X,
+    rows: u32,
+    k: u32,
+    n: u32,
+    o: &[f32],
+    gain: &[f32],
+    eps: f32,
+    fault: FaultSink,
+    z: &mut DisjointSlice<f32>,
+    y: &mut DisjointSlice<f32>,
+    form: F,
+    sh: *mut f32,
+) {
+    const {
+        assert!(MMA_ROWS == HEAD && MMA_COLS == 128);
+        assert!(MMA_WARP_COLS * HEAD <= STAGES * STAGE_FLOATS);
+    };
+    let units = if W::SCALED { k / 2 } else { k };
+    // SAFETY: the entry supplies the checked MMA launch and staging allocation.
+    let Some(mut tile) = (unsafe { bf16_mma_tile(w, x, rows, units, n, sh) }) else {
+        return;
+    };
+    let (rows, k, n) = (rows as usize, k as usize, n as usize);
+    // SAFETY: the tile's original staging allocation and K are unchanged.
+    let replay = unsafe { tile.needs_replay(sh, units as usize) };
+    // Retire every vote and flag reader before reusing the staging allocation.
+    thread::sync_threads();
+    if replay {
+        // SAFETY: each marked output cell belongs to this tile.
+        unsafe { tile.store::<true>(z, rows, n) };
+        thread::sync_threads();
+        // SAFETY: all 256 threads reach this converged with the tile's checked spans and its
+        // staging allocation sh; the barrier above retired the store and every shared reader.
+        unsafe { tile.replay(w, x.exact(), (rows, k, n), z, sh) };
+        thread::sync_threads();
+    }
+    let lane = warp::lane_id() as usize;
+    let warp = thread::threadIdx_x() as usize / 32;
+    for pass in 0..MMA_COLS / MMA_WARP_COLS {
+        let start = tile.col0 + pass * MMA_WARP_COLS;
+        if !replay {
+            if warp % (MMA_COLS / MMA_WARP_COLS) == pass {
+                for cell in 0..MMA_CELLS {
+                    thread::__unroll_config::<0>();
+                    let (r, c) = tile.coordinates(cell);
+                    if c < n {
+                        let at = (c - start) * HEAD + r - tile.row0;
+                        // SAFETY: this warp owns the slab's column range, each
+                        // fragment a disjoint cell in its shared 32-column head.
+                        unsafe { *sh.add(at) = tile.value(cell) };
+                    }
+                }
+            }
+            thread::sync_threads();
+        }
+        for token in 0..MMA_WARP_COLS / (MMA_THREADS as usize / 32) {
+            let c = start + warp + token * (MMA_THREADS as usize / 32);
+            if c < n {
+                let base = c * rows + tile.row0;
+                let mut ov = [0.0f32; 4];
+                let mut zv = [0.0f32; 4];
+                let mut wv = [0.0f32; 4];
+                for i in 0..4 {
+                    thread::__unroll_config::<0>();
+                    let at = lane + 32 * i;
+                    // SAFETY: c is live and the tile owns one complete head.
+                    ov[i] = unsafe { *o.get_unchecked(base + at) };
+                    // SAFETY: at < HEAD <= gain.len().
+                    wv[i] = unsafe { *gain.get_unchecked(at) };
+                    zv[i] = if replay {
+                        // SAFETY: the exact owner published this live z cell.
+                        unsafe { *z.get_unchecked_mut(base + at) }
+                    } else {
+                        // SAFETY: the preceding barrier published this slab.
+                        unsafe { *sh.add((c - start) * HEAD + at) }
+                    };
+                }
+                let values = norm_gate_values::<GATE_SIGMOID>(ov, zv, wv, eps, fault);
+                for i in 0..4 {
+                    thread::__unroll_config::<0>();
+                    // SAFETY: this warp owns c, each lane four disjoint values.
+                    unsafe { *y.get_unchecked_mut(base + lane + 32 * i) = values[i] };
+                }
+                // SAFETY: c < n is warp-uniform, so the warp is converged on a
+                // live column; this tile owns its head at row0, and form holds
+                // room for the n columns of rows values (this fn's contract).
+                unsafe { form.store(values, c, tile.row0, rows) };
+            }
+        }
+        // Retire the readers before the next slab overwrites shared memory.
+        thread::sync_threads();
+    }
+}
+
 impl Gemm32Kernels {
     /// Enqueue `y[c · rows + r] = Σ_k w[r·k + k'] · x[c·k + k']` for the
     /// first `n` columns of `x`, `w` an F32 weight of `rows × k` (module
@@ -1539,6 +2022,49 @@ impl Gemm32Kernels {
         Ok(())
     }
 
+    /// The BF16 prompt product and shared sigmoid norm in one launch. z is
+    /// scratch for exceptional exact replay only; ordinary tiles never write it.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "product operands and its norm tail"
+    )]
+    pub fn enqueue_bf16_mma_norm_gate(
+        &self,
+        stream: &CudaStream,
+        w: &DeviceTensor<u32>,
+        x: &DeviceBuffer<f32>,
+        act: &GemmAct32,
+        n: usize,
+        z: &mut DeviceBuffer<f32>,
+        tail: NormGateTail<'_>,
+    ) -> Result<(), GpuError> {
+        let what = "Gemm32Kernels::enqueue_bf16_mma_norm_gate";
+        let t = bf16_mma_launch(what, w, x, n, z)?;
+        tail.check_rows(what, w.rows(), n, z.len())?;
+        let form = held_form(what, act, MmaForm::Bf16, x, &t)?;
+        let prep =
+            self.module
+                .prepare_bf16_mma_norm_gate(LaunchConfig1D::new(t.grid, MMA_THREADS, 0))?;
+        self.module.bf16_mma_norm_gate(
+            stream,
+            &prep,
+            w.buf(),
+            x,
+            &form.words,
+            &form.refused,
+            t.rows,
+            t.k,
+            t.n,
+            tail.o,
+            tail.w,
+            tail.eps,
+            tail.fault,
+            z,
+            tail.y,
+        )?;
+        Ok(())
+    }
+
     /// The W8A8 product of an MXFP8 weight's planes as stored over the MXFP8
     /// form `act` holds of the first `n` columns of `x`
     /// ([`Self::enqueue_mxfp8_cols`]): E4M3 operands with their UE8M0 block
@@ -1564,20 +2090,90 @@ impl Gemm32Kernels {
         y: &mut DeviceBuffer<f32>,
     ) -> Result<(), GpuError> {
         let what = "Gemm32Kernels::enqueue_mxfp8_w8a8";
-        let (rows, k) = w.dimensions(what)?;
-        if w.scales != E4m3Scales::Mxfp8 {
-            return Err(GpuError::shape(
-                what,
-                format!("the weight's scales are {:?}, not MXFP8's", w.scales),
-            ));
-        }
-        crate::tensor::check_alignment::<U32x4, _>(what, "w.qs", w.qs.buf())?;
-        let t = mma_launch(what, rows, k, x, n, y)?;
+        let t = mxfp8_mma_launch(what, w, x, n, y)?;
         let form = held_form(what, act, MmaForm::Mxfp8, x, &t)?;
         #[cfg(bloomery_nvfp4_mma)]
         return self.native.mxfp8_w8a8(stream, w, x, form, &t, y);
         #[cfg(not(bloomery_nvfp4_mma))]
         Err(GpuError::state(what, NATIVE_BUILD))
+    }
+
+    /// [`Self::enqueue_mxfp8_w8a8`] and the shared sigmoid norm in one
+    /// kernel launch, as [`Self::enqueue_bf16_mma_norm_gate`] finishes a BF16
+    /// product: z is scratch for exceptional exact replay only. The kernel
+    /// also writes the MXFP8 form of the norm's output `tail.y` into `out`,
+    /// a scratch of `k` = the weight's rows made with room for it, bit for
+    /// bit [`Self::enqueue_mxfp8_cols`]'s, so the next MXFP8 site reads it
+    /// without a quantizer launch; `out`'s other form is left as another
+    /// rows'. A memset of `out`'s refusal words, which the kernel's heads OR,
+    /// comes first: two graph nodes.
+    #[cfg_attr(
+        not(bloomery_nvfp4_mma),
+        allow(unused_variables, reason = "the native build's launch reads them")
+    )]
+    pub fn enqueue_mxfp8_w8a8_norm_gate(
+        &self,
+        stream: &CudaStream,
+        a: Mxfp8NormGateArgs<'_>,
+    ) -> Result<(), GpuError> {
+        let what = "Gemm32Kernels::enqueue_mxfp8_w8a8_norm_gate";
+        let Mxfp8NormGateArgs {
+            w,
+            x,
+            act,
+            n_cols: n,
+            z,
+            tail,
+            out,
+        } = a;
+        let t = mxfp8_mma_launch(what, w, x, n, z)?;
+        tail.check_rows(what, t.rows as usize, n, z.len())?;
+        let form = held_form(what, act, MmaForm::Mxfp8, x, &t)?;
+        let y = tail.y.cu_deviceptr();
+        let into = out.out_planes(stream, what, MmaForm::Mxfp8, (t.rows as usize, n))?;
+        #[cfg(bloomery_nvfp4_mma)]
+        {
+            self.native.mxfp8_w8a8_norm_gate(
+                stream,
+                super::nvfp4mma::NativeNormGateArgs {
+                    w,
+                    x,
+                    form,
+                    t: &t,
+                    z,
+                    tail,
+                    out: into,
+                },
+            )?;
+            out.wrote(MmaForm::Mxfp8, y, n);
+            Ok(())
+        }
+        #[cfg(not(bloomery_nvfp4_mma))]
+        Err(GpuError::state(what, NATIVE_BUILD))
+    }
+
+    /// The wide HC up/mix launch (`hc_gated::up_mma_mix_body`) that also
+    /// writes the MXFP8 form of `mixed`'s columns into `a.planes`
+    /// ([`HcUpMixArgs`]). A build without the native block-scaled kernels
+    /// refuses it by name.
+    #[cfg_attr(
+        not(bloomery_nvfp4_mma),
+        allow(unused_variables, reason = "the native build's launch reads them")
+    )]
+    pub(crate) fn enqueue_hc_up_mix_mxfp8(
+        &self,
+        stream: &CudaStream,
+        a: HcUpMixArgs<'_>,
+    ) -> Result<(), GpuError> {
+        #[cfg(bloomery_nvfp4_mma)]
+        {
+            self.native.hc_up_mix_mxfp8(stream, a)
+        }
+        #[cfg(not(bloomery_nvfp4_mma))]
+        Err(GpuError::state(
+            "Gemm32Kernels::enqueue_hc_up_mix_mxfp8",
+            NATIVE_BUILD,
+        ))
     }
 }
 
@@ -1627,6 +2223,27 @@ fn held_form<'a>(
     ))
 }
 
+/// [`mma_launch`] for an MXFP8 weight's planes as stored. The tile copies
+/// the value plane in 16-byte pieces; other scales or alignment are a named
+/// `Shape` error.
+fn mxfp8_mma_launch(
+    what: &'static str,
+    w: E4m3Weight<'_>,
+    x: &DeviceBuffer<f32>,
+    n: usize,
+    y: &mut DeviceBuffer<f32>,
+) -> Result<TileLaunch, GpuError> {
+    let (rows, k) = w.dimensions(what)?;
+    if w.scales != E4m3Scales::Mxfp8 {
+        return Err(GpuError::shape(
+            what,
+            format!("the weight's scales are {:?}, not MXFP8's", w.scales),
+        ));
+    }
+    crate::tensor::check_alignment::<U32x4, _>(what, "w.qs", w.qs.buf())?;
+    mma_launch(what, rows, k, x, n, y)
+}
+
 /// Checked spans shared with the exact tile, with the MMA tile's grid.
 pub(crate) fn mma_launch(
     what: &'static str,
@@ -1658,6 +2275,47 @@ pub(crate) fn bf16_mma_launch(
     let launch = mma_launch(what, w.rows(), k, x, n, y)?;
     crate::tensor::check_alignment::<U32x4, _>(what, "w", w.buf())?;
     Ok(launch)
+}
+
+/// [`Gemm32Kernels::enqueue_mxfp8_w8a8_norm_gate`]'s arguments: the MXFP8
+/// weight `w` over the MXFP8 form `act` holds of the first `n_cols` columns
+/// of `x`, the exact replay's scratch `z` (`[n_cols][rows]`), the norm and
+/// gate operands `tail`, and `out`, the scratch the output's MXFP8 form goes
+/// into.
+pub struct Mxfp8NormGateArgs<'a> {
+    pub w: E4m3Weight<'a>,
+    pub x: &'a DeviceBuffer<f32>,
+    pub act: &'a GemmAct32,
+    pub n_cols: usize,
+    pub z: &'a mut DeviceBuffer<f32>,
+    pub tail: NormGateTail<'a>,
+    pub out: &'a mut GemmAct32,
+}
+
+/// [`Gemm32Kernels::enqueue_hc_up_mix_mxfp8`]'s arguments, as
+/// `hc_gated::HcWideKernels::enqueue_mix` checked them: the launch `cfg`
+/// over the BF16 up weight `w`, the bottleneck `lo` with its BF16 words
+/// `lo_words` and refusal words `lo_refused`, the normed rows `xn`, `m`
+/// columns of `hidden` values, the fault sink, the outputs `g` and `mixed`,
+/// and `planes`, the words, scale words and zeroed refusal words of
+/// `mixed`'s MXFP8 form ([`GemmAct32::out_planes`]).
+#[cfg_attr(
+    not(bloomery_nvfp4_mma),
+    allow(dead_code, reason = "the native build's launch reads them")
+)]
+pub(crate) struct HcUpMixArgs<'a> {
+    pub(crate) cfg: LaunchConfig1D,
+    pub(crate) w: &'a DeviceBuffer<u32>,
+    pub(crate) lo: &'a DeviceBuffer<f32>,
+    pub(crate) lo_words: &'a DeviceBuffer<u32>,
+    pub(crate) lo_refused: &'a DeviceBuffer<u32>,
+    pub(crate) xn: &'a DeviceBuffer<f32>,
+    pub(crate) hidden: u32,
+    pub(crate) m: u32,
+    pub(crate) fault: FaultSink,
+    pub(crate) g: &'a mut DeviceBuffer<f32>,
+    pub(crate) mixed: &'a mut DeviceBuffer<f32>,
+    pub(crate) planes: [&'a mut DeviceBuffer<u32>; 3],
 }
 
 /// A tile launch's grid and its `u32` arguments.

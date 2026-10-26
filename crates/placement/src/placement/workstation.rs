@@ -934,9 +934,12 @@ pub fn spec_of(card: &Card) -> Option<CardSpec> {
 pub struct HostNeed {
     pub experts: u64,
     pub tables: u64,
+    /// Pinned ring buffers, including the part loader's upload staging at load time.
     pub shadows: u64,
     pub reserves: u64,
     pub extra: u64,
+    /// Owned part results and their concurrent read/normalization scratch during loading.
+    pub read_ahead: u64,
     /// The plan's NVMe expert tier arena (`HostTotals::nvme_arena_bytes`):
     /// the bytes the tier's slots fill beside these terms, anonymous or
     /// pinned, 0 without one. [`HostNeed::bytes`] counts it;
@@ -977,6 +980,7 @@ impl HostNeed {
             shadows: totals.shadow_bytes,
             reserves: totals.reserve_bytes,
             extra,
+            read_ahead: 0,
             arena: totals.nvme_arena_bytes,
             cards: totals.pool_card_bytes,
             os: os_reserve(host),
@@ -1005,6 +1009,7 @@ impl HostNeed {
             self.shadows,
             self.reserves,
             self.extra,
+            self.read_ahead,
             if arena { self.arena } else { 0 },
             self.cards,
         ]
@@ -1169,6 +1174,9 @@ impl fmt::Display for HostShort {
         if n.extra > 0 {
             write!(f, " + residency churn pool {} B", n.extra)?;
         }
+        if n.read_ahead > 0 {
+            write!(f, " + part read-ahead {} B", n.read_ahead)?;
+        }
         if n.arena > 0 {
             write!(f, " + NVMe tier arena {} B", n.arena)?;
             if let Some(floor) = self.floor {
@@ -1258,7 +1266,7 @@ pub enum NeedTerm {
     /// The row-gathered tables the host holds ([`HostNeed::tables`]): the
     /// same mapping as the experts.
     Tables,
-    /// The cards' ring shadows ([`HostNeed::shadows`]).
+    /// The cards' pinned ring buffers and load-time upload staging ([`HostNeed::shadows`]).
     Shadows,
     /// The expert tier's prompt batch rows and places
     /// ([`TIER_BATCH_HOST_RESERVE`]), allocated with `cuMemAllocHost`.
@@ -1279,6 +1287,8 @@ pub enum NeedTerm {
     /// The residency churn pool ([`HostNeed::extra`]): runs of the host set,
     /// read in and locked with it.
     Extra,
+    /// Owned part results and read/normalization scratch ([`HostNeed::read_ahead`]).
+    PartReads,
     /// The NVMe tier's RAM arena ([`HostNeed::arena`]).
     Arena,
     /// The cards' share of a unified pool ([`HostNeed::cards`]).
@@ -1287,7 +1297,7 @@ pub enum NeedTerm {
 
 impl NeedTerm {
     /// Every term, in the order [`HostNeed::classes`] adds them.
-    pub const ALL: [NeedTerm; 11] = [
+    pub const ALL: [NeedTerm; 12] = [
         NeedTerm::Experts,
         NeedTerm::Tables,
         NeedTerm::Shadows,
@@ -1297,6 +1307,7 @@ impl NeedTerm {
         NeedTerm::RowCache,
         NeedTerm::RunAhead,
         NeedTerm::Extra,
+        NeedTerm::PartReads,
         NeedTerm::Arena,
         NeedTerm::Cards,
     ];
@@ -1317,6 +1328,7 @@ impl NeedTerm {
             | NeedTerm::Checkpoints
             | NeedTerm::PointRows => PageClass::Pinned,
             NeedTerm::RowCache | NeedTerm::RunAhead => PageClass::Cache,
+            NeedTerm::PartReads => PageClass::Anon,
             NeedTerm::Arena => {
                 if how.arena_pinned {
                     PageClass::Pinned
@@ -1449,6 +1461,7 @@ impl HostNeed {
         add(NeedTerm::RowCache, rows);
         add(NeedTerm::RunAhead, window);
         add(NeedTerm::Extra, self.extra);
+        add(NeedTerm::PartReads, self.read_ahead);
         add(NeedTerm::Arena, self.arena);
         add(NeedTerm::Cards, self.cards);
         Ok(classes)
@@ -2443,6 +2456,7 @@ mod tests {
             shadows: 10,
             reserves: 500,
             extra: 50,
+            read_ahead: 0,
             arena: 0,
             cards: 0,
             os: 400,
@@ -2473,11 +2487,35 @@ mod tests {
             shadows: 0,
             reserves: 11_955_785_728,
             extra: 0,
+            read_ahead: 0,
             arena: 20_335_071_232,
             cards: 0,
             os: 6_694_629_376,
             card_budget: false,
         }
+    }
+
+    #[test]
+    fn a_parts_load_reserves_its_read_ahead_before_allocating() {
+        let base = unpaged_need();
+        let need = HostNeed {
+            read_ahead: 8 << 30,
+            ..base
+        };
+        let available = base.bytes() + (1 << 30);
+        assert!(base.check(available).is_ok());
+        let short = need
+            .grant(available, 0)
+            .expect_err("owned parts exceed the host limit");
+        assert_eq!(short.need.read_ahead, 8 << 30);
+        assert!(short.to_string().contains("part read-ahead 8589934592 B"));
+        assert!(need.check(base.bytes() + (8 << 30)).is_ok());
+        assert!(need.check(base.bytes() + (8 << 30) - 1).is_err());
+        let overflow = HostNeed {
+            read_ahead: u64::MAX,
+            ..base
+        };
+        assert!(overflow.check(u64::MAX).is_err());
     }
 
     const PAGED_AVAILABLE: u64 = 27_499_458_560;
@@ -2560,6 +2598,7 @@ mod tests {
             shadows: 0,
             reserves: 8_533_127_168,
             extra: 0,
+            read_ahead: 0,
             arena: 0,
             cards: 0,
             os: 6_694_629_376,

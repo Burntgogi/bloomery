@@ -14,16 +14,24 @@
 //! `attn_bounds` also have a kernel-side contract, and the kernel mutants
 //! below pin that side. The gate's refusal loop turns red on a deleted launch
 //! check; a table that stayed green on one would be wrong.
+//!
+//! The tensor-op GEMMs' mutants ([`TENSOR_MUTANTS`]) edit their own program's
+//! text ([`TENSOR_SOURCE`]) and are caught by the `tensor_*` clauses, which
+//! run those kernels on any device that compiles them.
 
-use bloomery_metal::library::SOURCE;
+#[path = "../shared/mutants.rs"]
+mod program;
 
-/// A defect and the clause that must be red on it.
-pub struct Mutant {
-    pub name: &'static str,
-    pub clause: &'static str,
-    pub why: &'static str,
-    /// `(find, replace, occurrences of find)`, applied in order.
-    pub edits: &'static [(&'static str, &'static str, usize)],
+pub use program::{Mutant, Program, source_of};
+
+/// Every mutant of both tables, with the program it edits.
+pub fn all() -> impl Iterator<Item = (&'static Mutant, Program)> {
+    program::all(MUTANTS, TENSOR_MUTANTS)
+}
+
+/// The mutant of this name, and the program it edits.
+pub fn find(name: &str) -> Option<(&'static Mutant, Program)> {
+    all().find(|(m, _)| m.name == name)
 }
 
 const TAIL_STORE_FIND: &str =
@@ -546,6 +554,16 @@ pub const MUTANTS: &[Mutant] = &[
         )],
     },
     Mutant {
+        name: "head_last_group",
+        clause: "head_partial",
+        why: "the final reduction stops one candidate short, so the last threadgroup's winner is lost",
+        edits: &[(
+            "for (uint g = tid; g < groups; g += HEAD_THREADS) {",
+            "for (uint g = tid; g < groups - 1u; g += HEAD_THREADS) {",
+            1,
+        )],
+    },
+    Mutant {
         name: "head_ticket",
         clause: "head_ticket",
         why: "the step id is one past the selected row",
@@ -1025,8 +1043,8 @@ pub const MUTANTS: &[Mutant] = &[
         clause: "grouped_gemm",
         why: "the grouped GEMM's f16 range check is gone, so an activation past the half range casts to inf",
         edits: &[(
-            "const bool4 over = !(fabs(v) <= 65504.f);",
-            "const bool4 over = bool4(false);",
+            "const bool4 bad = !(fabs(v) <= 65504.f);",
+            "const bool4 bad = bool4(false);",
             1,
         )],
     },
@@ -1088,23 +1106,94 @@ pub const MUTANTS: &[Mutant] = &[
     },
 ];
 
-/// The mutant of this name.
-pub fn find(name: &str) -> Option<&'static Mutant> {
-    MUTANTS.iter().find(|m| m.name == name)
-}
-
-/// The kernels' source with the mutant's edits applied.
-pub fn source_of(mutant: &Mutant) -> Result<String, String> {
-    let mut text = SOURCE.to_string();
-    for (find, replace, count) in mutant.edits {
-        let found = text.matches(find).count();
-        if found != *count {
-            return Err(format!(
-                "mutant {}: {find:?} occurs {found} times, not {count}",
-                mutant.name
-            ));
-        }
-        text = text.replace(find, replace);
-    }
-    Ok(text)
-}
+/// The tensor-op GEMMs' defects, at least one for each `tensor_*` clause.
+pub const TENSOR_MUTANTS: &[Mutant] = &[
+    Mutant {
+        name: "tensor_k_step_skipped",
+        clause: "tensor_gemm_q4k",
+        why: "the dense tile's K loop stops one step short: the last 32 columns are never multiplied",
+        edits: &[(
+            "    for (int k0 = 0; k0 < cols; k0 += BK) {",
+            "    for (int k0 = 0; k0 + BK < cols; k0 += BK) {",
+            1,
+        )],
+    },
+    Mutant {
+        name: "tensor_rows_offset",
+        clause: "tensor_gemm_q6k",
+        why: "the dense op's weight fragment starts one staged row late: every output takes the next weight row",
+        edits: &[(
+            "auto ta = tensor_rows<T, TENSOR_SM>(sb + tm * LDA);\n    auto tw = tensor_rows<T, TENSOR_SN>(sa + tn * LDA);",
+            "auto ta = tensor_rows<T, TENSOR_SM>(sb + tm * LDA);\n    auto tw = tensor_rows<T, TENSOR_SN>(sa + (tn + 1) * LDA);",
+            1,
+        )],
+    },
+    Mutant {
+        name: "tensor_resid_stores",
+        clause: "tensor_gemm_a4",
+        why: "the residual epilogue stores the product over the output instead of adding to it",
+        edits: &[("*p = RESID ? *p + ct[i] : ct[i];", "*p = ct[i];", 1)],
+    },
+    Mutant {
+        name: "tensor_seg_out",
+        clause: "tensor_gemm_seg",
+        why: "every segment stores at the first segment's output offset",
+        edits: &[("y + args.segs[s].out", "y", 1)],
+    },
+    Mutant {
+        name: "tensor_range_no_raise",
+        clause: "tensor_gemm_range",
+        why: "an activation past the half range stages NaN but raises no quantizer site",
+        edits: &[(
+            "            if (any(bad)) {\n                raise(faults, layer, BLOOMERY_FAULT_SITE_QUANT_COLUMN);",
+            "            if (any(bad)) {",
+            1,
+        )],
+    },
+    Mutant {
+        name: "tensor_pair_swapped",
+        clause: "tensor_grouped_q4k",
+        why: "the pair's gate and up accumulators swap places in the SwiGLU",
+        edits: &[("pair_swiglu(cg[i], cu[i])", "pair_swiglu(cu[i], cg[i])", 1)],
+    },
+    Mutant {
+        name: "tensor_routed_short_block",
+        clause: "tensor_grouped_q4k",
+        why: "a SIMD group's second block of places runs only when the run passes it by more than 8: a run ending 1 to 8 places into the block leaves them unstored",
+        edits: &[(
+            "const bool live1 = tm + TENSOR_RM < count;",
+            "const bool live1 = tm + TENSOR_RM + 8 < count;",
+            1,
+        )],
+    },
+    Mutant {
+        name: "tensor_routed_block_rows",
+        clause: "tensor_grouped_a4",
+        why: "a SIMD group's second block of places reads the first block's staged rows",
+        edits: &[(
+            "auto ta1 = tensor_rows<T, TENSOR_RM>(sb + (tm + TENSOR_RM) * LDA);",
+            "auto ta1 = tensor_rows<T, TENSOR_RM>(sb + tm * LDA);",
+            1,
+        )],
+    },
+    Mutant {
+        name: "tensor_routed_k_step_skipped",
+        clause: "tensor_grouped_q6k",
+        why: "the routed tile's K loops (pair and plain) stop one step short",
+        edits: &[(
+            "        for (int k0 = 0; k0 < (int)args.cols; k0 += BK) {",
+            "        for (int k0 = 0; k0 + BK < (int)args.cols; k0 += BK) {",
+            2,
+        )],
+    },
+    Mutant {
+        name: "tensor_tile_no_raise",
+        clause: "tensor_grouped_a4",
+        why: "a tile the table cannot write stores nothing but raises no expert-id site",
+        edits: &[(
+            "            raise(faults, args.layer, BLOOMERY_FAULT_SITE_EXPERT_ID);",
+            "",
+            1,
+        )],
+    },
+];

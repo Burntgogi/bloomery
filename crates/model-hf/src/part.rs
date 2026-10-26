@@ -9,15 +9,18 @@
 //! experts or by a list, are the experts' own sources normalized in the part's order. A tensor
 //! the model moves into its layout after normalizing is made whole, moved, and then cut.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
+use std::ops::Range;
 
+use engram::EngramError;
+use engram::direct::{DIRECT_ALIGN, DirectFile, aligned_span};
 use gguf::{GgmlType, TensorInfo};
 use hf::modelopt::{self, Normal, Use};
 use hf::quant_config::{Placed, Plan};
 use model::part::{self, At, Part, Planned, Source, Take};
 use model::placement::ExpertList;
 use model::placement::tp::TpError;
-use safetensors::Folder;
+use safetensors::{Dtype, Folder, Raw};
 
 /// Why a part was refused.
 #[derive(Debug, thiserror::Error)]
@@ -34,6 +37,8 @@ pub enum Error {
     Release(#[from] model::placement::PlacementError),
     #[error(transparent)]
     Tensors(#[from] safetensors::Error),
+    #[error(transparent)]
+    Direct(#[from] engram::EngramError),
 }
 
 impl From<TpError> for Error {
@@ -212,6 +217,56 @@ impl Source for Checkpoint {
         Ok(out)
     }
 
+    fn read_bytes(&self, p: &Planned) -> Result<u64, Error> {
+        let name = &p.info.name;
+        let m = self
+            .made
+            .get(name)
+            .ok_or_else(|| refuse(name, "is not one the map makes"))?;
+        let placed = self.placed(m);
+        let ty = self.card_type(name, m)?;
+        let whole = whole(name, ty, &m.dims)?;
+        let cut = p.at.is_some() && m.step.is_none();
+        let format = modelopt::format_of(&placed)?;
+        let compressed = matches!(
+            format,
+            hf::quant_config::Format::Nvfp4Csf | hf::quant_config::Format::Nvfp4Csf32
+        );
+        let plain = matches!(
+            format,
+            hf::quant_config::Format::Bf16 | hf::quant_config::Format::F32
+        );
+        // Direct inputs, or growing cut buffers; decoded companion words and widened plain
+        // values coexist with them. A step may shrink the tensor, so its pre-step output is
+        // bounded from the stored bytes too. Output capacity can grow to twice its length.
+        let mut bytes = 0u64;
+        for n in stored(&placed) {
+            let companion = !m.sources.iter().any(|source| source == n);
+            let factor = if cut { 2u64 } else { 1 }
+                + u64::from(compressed) * 2
+                + u64::from(m.step.is_some()) * 3
+                + u64::from(plain || companion) * 4;
+            let (_, range) = self.folder.file_range(n)?;
+            bytes = range
+                .end
+                .checked_sub(range.start)
+                .and_then(|n| n.checked_mul(factor))
+                .and_then(|n| n.checked_add((2 * DIRECT_ALIGN) as u64))
+                .and_then(|n| bytes.checked_add(n))
+                .ok_or_else(|| refuse(name, "stored read bytes pass u64"))?;
+        }
+        let normal = if cut { p.info.nbytes } else { whole.nbytes };
+        let moved = if m.step.is_some() { whole.nbytes } else { 0 };
+        normal
+            .checked_mul(2)
+            .and_then(|n| n.checked_add(moved))
+            .and_then(|n| n.checked_add(p.info.nbytes))
+            .and_then(|n| n.checked_add(if compressed { whole.nbytes } else { 0 }))
+            .and_then(|n| n.checked_add((m.sources.len() as u64).checked_mul(8)?))
+            .and_then(|n| bytes.checked_add(n))
+            .ok_or_else(|| refuse(name, "normalized read bytes pass u64"))
+    }
+
     /// A tensor its format refuses, or that does not normalize into the planned type and bytes,
     /// is refused by name.
     fn read(&self, p: &Planned) -> Result<Part<'_>, Error> {
@@ -220,9 +275,22 @@ impl Source for Checkpoint {
             .made
             .get(name)
             .ok_or_else(|| refuse(name, "is not one the map makes"))?;
-        let get = |n: &str| self.folder.raw(n);
         let placed = self.placed(m);
         let ty = self.card_type(name, m)?;
+        // A whole tensor's stored bytes are read into memory of the read's own ([`read_whole`]);
+        // a part reads only its rows through the mapping.
+        let mut read = HashMap::new();
+        if p.at.is_none() || m.step.is_some() {
+            for n in stored(&placed) {
+                if let Some(w) = read_whole(&self.folder, n)? {
+                    read.insert(n, w);
+                }
+            }
+        }
+        let get = |n: &str| match read.get(n) {
+            Some(w) => Ok(w.raw()),
+            None => self.folder.raw(n),
+        };
         let n = match (&p.at, &m.step) {
             (Some(At::Along(dim, r)), None) => {
                 modelopt::normalize_part(get, &placed, m.role, &m.dims, (*dim, r.clone()))?
@@ -304,6 +372,71 @@ impl Source for Checkpoint {
         }
         Ok(())
     }
+}
+
+/// A stored tensor read whole into memory of its own ([`read_whole`]).
+struct Whole {
+    dtype: Dtype,
+    shape: Vec<usize>,
+    buf: Vec<u8>,
+    /// The tensor's bytes in `buf`.
+    at: Range<usize>,
+}
+
+impl Whole {
+    fn raw(&self) -> Raw<'_> {
+        Raw {
+            dtype: self.dtype,
+            shape: &self.shape,
+            bytes: &self.buf[self.at.clone()],
+        }
+    }
+}
+
+/// Stored tensor `name` read whole from its shard past the page cache (engram's direct reader)
+/// into new memory advised onto huge pages, so the read takes the drive's rate, faults once each
+/// 2 MiB and leaves the page cache as it was. `None` only when the shard's filesystem refuses
+/// direct reads as invalid or unsupported ([`DirectFile::open`]); other I/O errors propagate.
+fn read_whole(folder: &Folder, name: &str) -> Result<Option<Whole>, Error> {
+    let (path, range) = folder.file_range(name)?;
+    let file = match DirectFile::open(&path) {
+        Ok(file) => file,
+        Err(EngramError::OpenDirect { source, .. } | EngramError::DirectProbe { source, .. })
+            if matches!(
+                source.kind(),
+                std::io::ErrorKind::InvalidInput | std::io::ErrorKind::Unsupported
+            ) =>
+        {
+            return Ok(None);
+        }
+        Err(e) => return Err(e.into()),
+    };
+    let raw = folder.raw(name)?;
+    let (start, span, need) = aligned_span(range.start, range.end - range.start);
+    let mut buf = vec![0u8; span + DIRECT_ALIGN];
+    os::advise_huge_within(&mut buf);
+    let lead = buf.as_ptr().align_offset(DIRECT_ALIGN);
+    if file.read_span(&mut buf[lead..lead + span], start)? < need {
+        return Err(refuse(
+            name,
+            format!("{} ends inside its bytes", path.display()),
+        ));
+    }
+    let skip = need - raw.bytes.len();
+    Ok(Some(Whole {
+        dtype: raw.dtype,
+        shape: raw.shape.to_vec(),
+        buf,
+        at: lead + skip..lead + need,
+    }))
+}
+
+/// The stored tensors a tensor placed as `placed` is made of: each source, then the companions
+/// its place names (scales, the packed shape).
+fn stored<'s>(placed: &[(&'s str, &'s Placed)]) -> impl Iterator<Item = &'s str> {
+    placed.iter().flat_map(|&(source, placed)| {
+        std::iter::once(source).chain(placed.companions.iter().map(String::as_str))
+    })
 }
 
 /// The whole tensor `name` of `ty` and `dims` as a header entry; dims that are not whole blocks
@@ -967,6 +1100,76 @@ pub(crate) mod tests {
                 Take::Skip
             })
         }
+    }
+
+    #[test]
+    fn read_peaks_cover_the_owned_inputs_and_results() {
+        let dir = temp_dir("read-peak");
+        let mut c = checkpoint(&dir);
+        let shrinking = c.made.get_mut("mx.weight").unwrap();
+        shrinking.dims[1] = 1;
+        shrinking.step = Some(Box::new(|n| {
+            let row = n.bytes.len() / n.dims[1] as usize;
+            n.bytes.truncate(row);
+            n.dims[1] = 1;
+            Ok(())
+        }));
+        let planned = c.plan(|_, _, _| Ok::<_, String>(Take::Whole)).unwrap();
+        for p in &planned {
+            let read_bytes = c.read_bytes(p).unwrap();
+            let part = c.read(p).unwrap();
+            let output: u64 = part.spans().iter().map(|s| s.len() as u64).sum();
+            let made = &c.made[&p.info.name];
+            let placed = c.placed(made);
+            let before = modelopt::normalize(|n| c.folder.raw(n), &placed, made.role).unwrap();
+            let output = output.max(before.bytes.capacity() as u64);
+            let stored: u64 = stored(&placed)
+                .map(|n| {
+                    let (_, r) = c.folder.file_range(n).unwrap();
+                    let (_, span, _) = aligned_span(r.start, r.end - r.start);
+                    (span + DIRECT_ALIGN) as u64
+                })
+                .sum();
+            assert!(
+                read_bytes >= stored + output,
+                "{}: {read_bytes} < {}",
+                p.info.name,
+                stored + output
+            );
+        }
+        let p = planned.iter().find(|p| p.info.name == "v.weight").unwrap();
+        c.made.get_mut("v.weight").unwrap().dims = vec![u64::MAX, 2];
+        assert!(
+            c.read_bytes(p)
+                .unwrap_err()
+                .to_string()
+                .contains("v.weight")
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_mapped_shard_does_not_hide_a_direct_open_error() {
+        let dir = temp_dir("direct-error");
+        let c = checkpoint(&dir);
+        let (path, _) = c.folder.file_range("bf.w").unwrap();
+        std::fs::rename(&path, path.with_extension("moved")).unwrap();
+        let parts = c.plan(rule("bf.weight", 0, 0, 1)).unwrap();
+        assert_eq!(parts.len(), 1);
+        for p in parts {
+            match c.read(&p) {
+                Err(Error::Direct(EngramError::OpenDirect {
+                    path: found,
+                    source,
+                })) => {
+                    assert_eq!(found, path);
+                    assert_eq!(source.kind(), std::io::ErrorKind::NotFound);
+                }
+                Err(e) => panic!("unexpected error: {e}"),
+                Ok(_) => panic!("the mapping hid the missing shard"),
+            }
+        }
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     /// Before any value is read, a source the plan does not place, a refusal of the rule and a

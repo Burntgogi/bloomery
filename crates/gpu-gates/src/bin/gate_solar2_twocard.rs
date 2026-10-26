@@ -88,7 +88,8 @@ mod gate {
 
     use crate::e2e::walk;
     use crate::quiet::Quiet;
-    use crate::tier_twocard::{Leg, Sent, same, sent_between, sent_every, union_plan};
+    use crate::tier_twocard::{Leg, Sent, same, sent_between, sent_every};
+    use model::placement::union_plan;
 
     const NAME: &str = "gate_solar2_twocard";
     /// The card budget both plans are made under in the real tier (module header: the union it leaves fits the A6000).

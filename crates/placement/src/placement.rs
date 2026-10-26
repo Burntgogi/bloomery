@@ -28,6 +28,7 @@
 //! expert at a time on the layer that holds the fewest so far, so the
 //! per-layer totals stay even ([`Plan::tier_n_l`]).
 
+use std::cell::RefCell;
 use std::fmt;
 use std::num::NonZeroU64;
 use std::ops::Range;
@@ -1207,6 +1208,139 @@ pub struct Plan<'a> {
     pub budget_from_pool: bool,
 }
 
+/// The one-stage reference of a one-expert-tier plan: the stage holds the union
+/// of its routed ids and the tier's, and the host segments are unchanged.
+/// `flat` is the same stage machine with the tier removed. The reference uses
+/// the stage's actual capacity, not the artificial budget that split the sets.
+pub fn union_plan<'a>(plan: &Plan<'a>, flat: &'a Machine) -> Result<Plan<'a>, PlacementError> {
+    if plan.machine.cards.len() != 1
+        || plan.machine.expert_tiers().count() != 1
+        || flat.cards.len() != 1
+        || !flat.tiers.is_empty()
+        || !plan.machine.cards[0].same_device(&flat.cards[0])
+    {
+        return Err(PlacementError::Stages(
+            "union reference needs one stage, one expert tier and the same stage without tiers"
+                .into(),
+        ));
+    }
+    let model = plan.model;
+    let tier = Device::Card(plan.machine.cards.len());
+    let mut out = plan.clone();
+    for row in &mut out.rows {
+        let t = &model.tensors[row.tensor];
+        if t.role != Role::RoutedExperts {
+            continue;
+        }
+        let ids = |d: Device| -> Vec<u32> {
+            row.segments
+                .iter()
+                .filter(|s| s.device == d)
+                .filter_map(|s| s.experts.as_ref())
+                .flat_map(|e| e.ids().iter().copied())
+                .collect()
+        };
+        let on_tier = ids(tier);
+        if on_tier.is_empty() {
+            continue;
+        }
+        let mut union = ids(Device::Card(0));
+        union.extend(on_tier);
+        let n = union.len() as u64;
+        let mut format = None;
+        for segment in row
+            .segments
+            .iter()
+            .filter(|s| s.device == Device::Card(0) || s.device == tier)
+        {
+            let Format::Card(selected) = segment.format else {
+                return Err(PlacementError::tensor(
+                    t,
+                    "union reference needs resident card expert segments",
+                ));
+            };
+            if format.is_some_and(|f| f != selected) {
+                return Err(PlacementError::tensor(
+                    t,
+                    "union reference cannot join different selected card formats",
+                ));
+            }
+            format = Some(selected);
+        }
+        let card = routed_row_on_as(
+            row.tensor,
+            t,
+            0,
+            vec![(0, ExpertList::new(union, model.experts_of(t))?)],
+            model,
+            format,
+        )?;
+        let segments = card
+            .segments
+            .into_iter()
+            .filter(|s| s.device == Device::Card(0))
+            .chain(
+                row.segments
+                    .iter()
+                    .filter(|s| !matches!(s.device, Device::Card(_)))
+                    .cloned(),
+            )
+            .collect();
+        *row = Row {
+            segments,
+            ..row.clone()
+        };
+        if let Some(l) = t.layer.and_then(|l| out.n_l.get_mut(l)) {
+            *l = n;
+        }
+    }
+    out.machine = flat;
+    out.cards.truncate(1);
+    out.tier_n_l.clear();
+    out.card_budget = card_budget::CardBudget::default();
+    out.budget_from_pool = false;
+    let (heaps, _) = card_heaps(model, flat, &out.rows);
+    let card = &flat.cards[0];
+    let total = &mut out.cards[0];
+    total.expert_bytes = out
+        .rows
+        .iter()
+        .flat_map(|r| {
+            r.segments.iter().filter_map(|s| {
+                (model.tensors[r.tensor].role == Role::RoutedExperts && s.device == Device::Card(0))
+                    .then_some(s.resident_bytes)
+            })
+        })
+        .sum();
+    total.experts = out.n_l.iter().sum();
+    total.rounding_bytes = heaps[0].taken - total.dense_bytes - total.expert_bytes;
+    total.reserve_bytes = card.selected_reserve_bytes(model, &out.n_l)?;
+    let used = card
+        .floor_with_reserves(
+            heaps[0].taken,
+            total.kv_bytes,
+            total.stage_rows_bytes,
+            total.reserve_bytes,
+        )
+        .ok_or_else(|| card.bytes_past_u64())?;
+    total.headroom_bytes = i128::from(capped(card, None)) - i128::from(used);
+    let limit = capped(card, None).saturating_sub(card.margin_bytes);
+    if used > limit {
+        return Err(PlacementError::Metadata {
+            key: "union reference".into(),
+            detail: Violation::CardOver {
+                card: card.name.clone(),
+                total: used,
+                limit,
+            }
+            .to_string(),
+        });
+    }
+    out.host.headroom_bytes = workstation::HostNeed::of_totals(flat.host(), &out.host, false, 0)
+        .headroom(workstation::HostNeed::machine_room(flat.host()));
+    Ok(out)
+}
+
 /// Why a placement could not be built; each variant names what it refused.
 #[derive(Debug, thiserror::Error)]
 pub enum PlacementError {
@@ -2322,29 +2456,160 @@ fn card_uploads<'m>(
     Ok(out)
 }
 
-/// The bytes of the granules `uploads` take with `n_l` experts on each layer:
-/// every upload's buffers, in order, through the card's allocator ([`Heap`]).
-fn footprint(
+/// The bytes of the granules a card's uploads take with `n_l` experts on each layer: every
+/// upload's buffers, in order, through the card's allocator ([`Heap`]). The expert rule asks it
+/// once an expert ([`spread`]), and each ask changes one layer's count, so each step of the
+/// uploads keeps what it worked out last: its buffers at its last rows, and what its small
+/// buffers did to the shared granules from the granules it found. A buffer of a granule or more
+/// takes whole granules of its own wherever it falls in the order, so only the small buffers
+/// depend on the granules a step finds; a step that finds them as it last found them, with the
+/// same small buffers, leaves them as it last left them.
+struct Footprint<'m> {
     granule: NonZeroU64,
-    uploads: &[(&ModelTensor, CardFormat, Held)],
-    n_l: &[u64],
-) -> Result<u64, PlacementError> {
-    let mut heap = Heap::new(granule);
-    for &(t, format, held) in uploads {
-        let rows = match held {
-            Held::Rows(rows) => rows,
-            Held::Experts {
-                layer,
-                rows_per_expert,
-            } => n_l[layer] * rows_per_expert,
-        };
-        if rows > 0 {
-            for b in card_buffers(t, format, rows)? {
-                heap.alloc(b);
-            }
+    steps: Vec<Step<'m>>,
+}
+
+struct Step<'m> {
+    what: What<'m>,
+    last: RefCell<Last>,
+}
+
+/// One step of [`Footprint`]'s uploads, in order.
+enum What<'m> {
+    /// Fixed uploads' buffers.
+    Fixed,
+    /// An upload whose buffers follow its layer's count: a routed stack, or one whose buffers
+    /// are refused, which each count refuses in its place.
+    Upload(&'m ModelTensor, CardFormat, Held),
+}
+
+/// What a step worked out last.
+#[derive(Default)]
+struct Last {
+    /// The rows its buffers are of; `None` before the first.
+    rows: Option<u64>,
+    /// The bytes of its buffers of a granule or more, rounded to whole granules.
+    large: u64,
+    /// Its smaller buffers, in order.
+    small: Vec<u64>,
+    /// The shared granules' bytes left as its small buffers found them, and what the buffers
+    /// did there; `None` until they are allocated.
+    effect: Option<(Vec<u64>, Effect)>,
+}
+
+/// What a run of small buffers did to the shared granules: the bytes left it set by index, the
+/// granules it opened (their bytes left), and the bytes of those granules.
+struct Effect {
+    set: Vec<(usize, u64)>,
+    opened: Vec<u64>,
+    took: u64,
+}
+
+impl Last {
+    fn of(granule: NonZeroU64, rows: u64, buffers: Vec<u64>) -> Last {
+        let (large, small): (Vec<u64>, Vec<u64>) =
+            buffers.into_iter().partition(|&b| b >= granule.get());
+        Last {
+            rows: Some(rows),
+            large: allocator_bytes(granule, large),
+            small,
+            effect: None,
         }
     }
-    Ok(heap.taken)
+}
+
+impl<'m> Footprint<'m> {
+    fn new(granule: NonZeroU64, uploads: &[(&'m ModelTensor, CardFormat, Held)]) -> Footprint<'m> {
+        let mut steps: Vec<Step<'m>> = Vec::new();
+        for &(t, format, held) in uploads {
+            let fixed = match held {
+                Held::Rows(0) => continue,
+                Held::Rows(rows) => card_buffers(t, format, rows).ok(),
+                Held::Experts { .. } => None,
+            };
+            let Some(buffers) = fixed else {
+                steps.push(Step {
+                    what: What::Upload(t, format, held),
+                    last: RefCell::default(),
+                });
+                continue;
+            };
+            let add = Last::of(granule, 0, buffers);
+            if let Some(Step {
+                what: What::Fixed,
+                last,
+            }) = steps.last_mut()
+            {
+                let last = last.get_mut();
+                last.large += add.large;
+                last.small.extend(add.small);
+            } else {
+                steps.push(Step {
+                    what: What::Fixed,
+                    last: RefCell::new(add),
+                });
+            }
+        }
+        Footprint { granule, steps }
+    }
+
+    fn at(&self, n_l: &[u64]) -> Result<u64, PlacementError> {
+        let mut heap = Heap::new(self.granule);
+        // Whether the shared granules are as the last ask found them at this step.
+        let mut same = true;
+        for step in &self.steps {
+            let mut last = step.last.borrow_mut();
+            if let What::Upload(t, format, held) = step.what {
+                let rows = match held {
+                    Held::Rows(rows) => rows,
+                    Held::Experts {
+                        layer,
+                        rows_per_expert,
+                    } => n_l[layer] * rows_per_expert,
+                };
+                if last.rows != Some(rows) {
+                    let buffers = if rows > 0 {
+                        card_buffers(t, format, rows)?
+                    } else {
+                        Vec::new()
+                    };
+                    let now = Last::of(self.granule, rows, buffers);
+                    let effect = last.effect.take().filter(|_| now.small == last.small);
+                    *last = Last { effect, ..now };
+                }
+            }
+            let last = &mut *last;
+            heap.taken += last.large;
+            match &last.effect {
+                Some((found, e)) if same || *found == heap.left => {
+                    for &(i, left) in &e.set {
+                        heap.left[i] = left;
+                    }
+                    heap.left.extend_from_slice(&e.opened);
+                    heap.taken += e.took;
+                    same = true;
+                }
+                _ => {
+                    let (found, open, taken) = (heap.left.clone(), heap.left.len(), heap.taken);
+                    for &b in &last.small {
+                        heap.alloc(b);
+                    }
+                    let set = (0..open)
+                        .filter(|&i| heap.left[i] != found[i])
+                        .map(|i| (i, heap.left[i]))
+                        .collect();
+                    let effect = Effect {
+                        set,
+                        opened: heap.left[open..].to_vec(),
+                        took: heap.taken - taken,
+                    };
+                    last.effect = Some((found, effect));
+                    same = false;
+                }
+            }
+        }
+        Ok(heap.taken)
+    }
 }
 
 /// The placement's levers, which a binary parses once
@@ -2572,10 +2837,6 @@ fn plan_rule<'a>(
     let mut rows: Vec<Option<Row>> = vec![None; model.tensors.len()];
     let mut stacks: Vec<Vec<usize>> = vec![Vec::new(); model.layers];
     for (i, t) in model.tensors.iter().enumerate() {
-        // A never-loaded tensor's shape is nothing a card must take.
-        if let Some(format) = model.card_format(t).filter(|_| t.role != Role::Unused) {
-            card_bytes(t, format, rows_of(t))?;
-        }
         if t.role == Role::RoutedExperts {
             stacks[layer_of(t, model.layers)?].push(i);
         } else {
@@ -2767,7 +3028,7 @@ fn resolve_shares(
         };
         let own = eligible(layers, stacks, model, routed)?;
         let uploads = card_uploads(model, c, rows, &own, routed)?;
-        let dense = footprint(card.granule_bytes, &uploads, &zeros)?;
+        let dense = Footprint::new(card.granule_bytes, &uploads).at(&zeros)?;
         let kv = kv_card.saturating_add(stage_rows);
         let reserves = card.selected_reserve_bytes(model, &zeros)?;
         let floor = plan_floor(card, dense, kv, reserve, reserves);
@@ -2807,7 +3068,7 @@ fn resolve_shares(
     let routable = eligible(0..model.layers, stacks, model, routed)?;
     let caps: Vec<u64> = (0..model.layers).map(|l| model.layer_experts(l)).collect();
     let experts = card_uploads(model, cards.len(), rows, &routable, routed)?;
-    let total = footprint(cards[0].granule_bytes, &experts, &caps)?;
+    let total = Footprint::new(cards[0].granule_bytes, &experts).at(&caps)?;
     let per = named
         .iter()
         .zip(card_budget::split(&parts, total))
@@ -2920,6 +3181,7 @@ impl Fill<'_, '_> {
             .routed
             .unwrap_or(RoutedRule::PerType(CardFormat::of_routed));
         let uploads = card_uploads(self.model, self.c, self.rows, self.eligible, format)?;
+        let footprint = Footprint::new(card.granule_bytes, &uploads);
         let mut down_acts = if card.tier_leg.is_some() {
             vec![None; self.model.layers]
         } else {
@@ -2964,18 +3226,19 @@ impl Fill<'_, '_> {
             - i128::from(self.reserve)
             + i128::from(bound);
         if let Some(b) = self.card_budget {
-            let dense = footprint(card.granule_bytes, &uploads, n_l)?;
+            let dense = footprint.at(n_l)?;
             check_floor(card, b, dense, self.kv, self.reserve, reserves)?;
         }
         if let Some(free) = card.free_bytes.filter(|&f| f < card.usable_bytes) {
-            let dense = footprint(card.granule_bytes, &uploads, n_l)?;
+            let dense = footprint.at(n_l)?;
             check_free_floor(card, free, dense, self.kv, self.reserve, reserves)?;
         }
         let caps: Vec<u64> = (0..n_l.len())
             .map(|l| self.model.layer_experts(l))
             .collect();
         spread(n_l, held, self.eligible, &caps, budget, |n| {
-            footprint(card.granule_bytes, &uploads, n)?
+            footprint
+                .at(n)?
                 .checked_add(scratch(n)?)
                 .ok_or_else(|| card.bytes_past_u64())
         })
@@ -5062,6 +5325,180 @@ mod tests {
         }
     }
 
+    /// The footprint the expert rule asks once an expert is the allocator's replay of every
+    /// buffer in order, whatever counts it is asked at and in whatever order: fixed tensors
+    /// below and above a granule between stacks whose buffers cross it as their counts grow.
+    #[test]
+    fn a_footprint_is_the_replay_of_every_buffer_at_any_counts() {
+        let tensor = |name: &str, layer, role, ty: GgmlType, dims: Vec<u64>| ModelTensor {
+            name: name.into(),
+            shard: 0,
+            layer,
+            role,
+            ty,
+            dims,
+            file_bytes: 0,
+            gathered_rows: None,
+        };
+        let (layers, granule) = (3, NonZeroU64::new(4096).expect("nonzero"));
+        let mut tensors = Vec::new();
+        for l in 0..layers {
+            tensors.push(tensor(
+                "norm",
+                Some(l),
+                Role::Attention,
+                GgmlType::F32,
+                vec![256],
+            ));
+            tensors.push(tensor(
+                "big",
+                Some(l),
+                Role::Attention,
+                GgmlType::Q8_0,
+                vec![256, 20],
+            ));
+            tensors.push(tensor(
+                "small",
+                Some(l),
+                Role::Attention,
+                GgmlType::Q8_0,
+                vec![256, 3],
+            ));
+            tensors.push(tensor(
+                "stack",
+                Some(l),
+                Role::RoutedExperts,
+                GgmlType::Q4_K,
+                vec![256, 8, 9],
+            ));
+        }
+        let uploads: Vec<_> = tensors
+            .iter()
+            .map(|t| {
+                let format = CardFormat::of(t.ty).expect("a card format");
+                let held = match t.role {
+                    Role::RoutedExperts => Held::Experts {
+                        layer: t.layer.expect("a layer"),
+                        rows_per_expert: 8,
+                    },
+                    _ => Held::Rows(rows_of(t)),
+                };
+                (t, format, held)
+            })
+            .collect();
+        let replay = |n_l: &[u64]| {
+            let buffers = uploads.iter().flat_map(|&(t, format, held)| {
+                let rows = match held {
+                    Held::Rows(rows) => rows,
+                    Held::Experts {
+                        layer,
+                        rows_per_expert,
+                    } => n_l[layer] * rows_per_expert,
+                };
+                if rows == 0 {
+                    Vec::new()
+                } else {
+                    card_buffers(t, format, rows).expect("buffers")
+                }
+            });
+            allocator_bytes(granule, buffers)
+        };
+        let footprint = Footprint::new(granule, &uploads);
+        let mut n_l = vec![0u64; layers];
+        let mut seed = 7u64;
+        for ask in 0..400 {
+            if ask < 27 {
+                n_l[ask % layers] += 1;
+            } else {
+                seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+                n_l[(seed >> 33) as usize % layers] = (seed >> 40) % 10;
+            }
+            assert_eq!(
+                footprint.at(&n_l).expect("a footprint"),
+                replay(&n_l),
+                "{n_l:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn only_card_uploads_require_the_card_layout() {
+        for width in [64, 160] {
+            for (role, embedding, device) in [
+                (Role::EngramTable, false, Device::Nvme),
+                (Role::HashTable, false, Device::Host),
+                (Role::TokenEmbedding, false, Device::Host),
+                (Role::Unread, false, Device::Unused),
+                (Role::Unused, false, Device::Unused),
+                (Role::Attention, false, Device::Card(0)),
+                (Role::TokenEmbedding, true, Device::Card(0)),
+            ] {
+                let mut model = layered(1);
+                model.tensors[0] = ModelTensor {
+                    name: "rows.weight".into(),
+                    shard: 0,
+                    layer: (role != Role::TokenEmbedding).then_some(0),
+                    role,
+                    ty: GgmlType::NVFP4_ROWS,
+                    dims: vec![width, 5],
+                    file_bytes: width / 16 * 9 * 5,
+                    gathered_rows: Some(1),
+                };
+                let machine = Machine {
+                    cards: vec![Card {
+                        usable_bytes: 1 << 30,
+                        ..card("card", 0..1, true, embedding)
+                    }],
+                    tiers: Vec::new(),
+                    nodes: vec![Node {
+                        host: host(),
+                        unified: None,
+                    }],
+                };
+                let planned = plan_with(&model, &machine, 4096, &NoKv, None);
+                if width == 160 && device == Device::Card(0) {
+                    let error = planned
+                        .expect_err("the upload needs whole card blocks")
+                        .to_string();
+                    assert!(error.contains("rows.weight"), "{error}");
+                    assert!(error.contains("Nvfp4Planes upload refuses"), "{error}");
+                } else {
+                    let plan = planned.unwrap_or_else(|e| panic!("{role:?} {width}: {e}"));
+                    assert_eq!(plan.rows[0].segments[0].device, device);
+                }
+            }
+        }
+        // A routed stack the host planner keeps whole on the host takes no
+        // card layout, while the expert rule's card segments of it are refused.
+        let mut model = layered(1);
+        model.tensors[1] = ModelTensor {
+            ty: GgmlType::NVFP4_ROWS,
+            dims: vec![160, 4, 8],
+            file_bytes: 160 / 16 * 9 * 4 * 8,
+            ..model.tensors[1].clone()
+        };
+        let machine = Machine {
+            cards: vec![Card {
+                usable_bytes: 1 << 30,
+                ..card("card", 0..1, true, true)
+            }],
+            tiers: Vec::new(),
+            nodes: vec![Node {
+                host: host(),
+                unified: None,
+            }],
+        };
+        let plan = plan_host_routed(&model, &machine, 4096, &NoKv, &PlanLevers::default())
+            .unwrap_or_else(|e| panic!("host-routed 160: {e}"));
+        let devices: Vec<Device> = plan.rows[1].segments.iter().map(|s| s.device).collect();
+        assert_eq!(devices, vec![Device::Host]);
+        let error = plan_with(&model, &machine, 4096, &NoKv, None)
+            .expect_err("card experts need whole card blocks")
+            .to_string();
+        assert!(error.contains("experts 0"), "{error}");
+        assert!(error.contains("Nvfp4Planes upload refuses"), "{error}");
+    }
+
     /// A model of 4 layers with every role's bf16 tensor (an attention
     /// matrix, a hyper-connection, a shared expert and its one-row gate, a
     /// router, an FFN norm, the head and the token embedding, 256-value rows)
@@ -6072,6 +6509,147 @@ mod tests {
         assert_eq!(plan.n_l, vec![8]);
     }
 
+    #[test]
+    fn a_union_recounts_uploads_selected_forms_and_capacity() {
+        use crate::kernels::{DownAct, DownForms};
+        use workstation::{TIER_BATCH_RESERVE, tier_leg_batch_bytes};
+
+        let mut model = legged(&[
+            [GgmlType::IQ3_S, GgmlType::IQ3_S, GgmlType::Q5_K],
+            [GgmlType::IQ4_XS, GgmlType::IQ4_XS, GgmlType::Q8_0],
+        ]);
+        model.experts_used = 6;
+        let forms = DownForms::of(DownAct::Q8Act).with(DownAct::Q8Blocks32);
+        let batch = tier_leg_batch_bytes(256, 256, 6, 2, 3, forms, false).unwrap();
+        let mut stage = bytes_card("stage", 1 << 30, 0..2);
+        stage.tier_leg = batch.leg;
+        stage
+            .reserves
+            .push((TIER_BATCH_RESERVE.into(), batch.card().unwrap()));
+        let flat = Machine {
+            cards: vec![stage],
+            tiers: Vec::new(),
+            nodes: vec![Node {
+                host: host(),
+                unified: None,
+            }],
+        };
+        let machine = Machine {
+            tiers: vec![bytes_card("tier", 1 << 30, 0..0)],
+            ..flat.clone()
+        };
+        let rule = crate::accepts::routed_rule(crate::accepts::Program::FlintBody);
+        let (index, iq3) = model
+            .tensors
+            .iter()
+            .enumerate()
+            .find(|(_, t)| t.role == Role::RoutedExperts && t.ty == GgmlType::IQ3_S)
+            .unwrap();
+        assert!(matches!(
+            routed_row(
+                index,
+                iq3,
+                0,
+                ExpertList::new(vec![0], model.experts).unwrap(),
+                &model
+            ),
+            Err(PlacementError::NoCardFormat { .. })
+        ));
+        let mut rows = plan_routed(&model, &flat, 1, &NoKv, &PlanLevers::default(), rule)
+            .unwrap()
+            .rows;
+        for row in &mut rows {
+            let tensor = &model.tensors[row.tensor];
+            if tensor.role == Role::RoutedExperts {
+                let device = usize::from(tensor.layer == Some(1));
+                *row = routed_row_on_as(
+                    row.tensor,
+                    tensor,
+                    0,
+                    vec![(device, ExpertList::new(vec![0], model.experts).unwrap())],
+                    &model,
+                    rule.format(tensor).unwrap(),
+                )
+                .unwrap();
+            }
+        }
+        let plan = totals(
+            &model,
+            &machine,
+            1,
+            rows,
+            &[(0, 0, 0); 2],
+            (vec![1, 0], vec![vec![0, 1]]),
+            card_budget::CardBudget::default(),
+        )
+        .unwrap();
+        let joined = union_plan(&plan, &flat).unwrap();
+        assert_eq!(joined.n_l, [1, 1]);
+        assert!(joined.tier_n_l.is_empty());
+        assert_eq!(
+            joined.cards[0].expert_bytes,
+            plan.cards[0].expert_bytes + plan.cards[1].expert_bytes
+        );
+        assert_eq!(joined.cards[0].experts, 2);
+        let heap = card_heaps(&model, &flat, &joined.rows).0.remove(0);
+        assert_eq!(
+            joined.cards[0].rounding_bytes,
+            heap.taken - joined.cards[0].dense_bytes - joined.cards[0].expert_bytes
+        );
+        let reserve = batch.staging + batch.leg.unwrap().bytes(forms).unwrap();
+        assert_eq!(joined.cards[0].reserve_bytes, reserve);
+        assert_eq!(
+            joined.card_reserve(0, TIER_BATCH_RESERVE).unwrap(),
+            Some(reserve)
+        );
+        assert!(reserve > plan.cards[0].reserve_bytes);
+        assert_eq!(joined.cards[0].kv_bytes, plan.cards[0].kv_bytes);
+        for (before, after) in plan.rows.iter().zip(&joined.rows) {
+            let host = |row: &Row| {
+                row.segments
+                    .iter()
+                    .filter(|s| !matches!(s.device, Device::Card(_)))
+                    .map(|s| {
+                        (
+                            s.device,
+                            s.resident_bytes,
+                            s.experts.as_ref().map(|e| e.ids().to_vec()),
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(host(before), host(after));
+        }
+        let mut conflicting = plan.clone();
+        let row = conflicting
+            .rows
+            .iter_mut()
+            .find(|r| r.segments.iter().any(|s| s.device == Device::Card(1)))
+            .unwrap();
+        let mut other = row
+            .segments
+            .iter()
+            .find(|s| s.device == Device::Card(1))
+            .unwrap()
+            .clone();
+        other.device = Device::Card(0);
+        other.format = Format::Card(CardFormat::F32);
+        row.segments.push(other);
+        assert!(matches!(
+            union_plan(&conflicting, &flat),
+            Err(PlacementError::Tensor { .. })
+        ));
+        let mut short = flat.clone();
+        short.cards[0].usable_bytes = joined.cards[0].bytes() - 1;
+        assert!(matches!(union_plan(&plan, &short),
+            Err(PlacementError::Metadata { key, .. }) if key == "union reference"));
+        let mut wrong = flat.clone();
+        wrong.cards.clear();
+        assert!(matches!(
+            union_plan(&plan, &wrong),
+            Err(PlacementError::Stages(_))
+        ));
+    }
     /// Scratch enters each expert candidate's footprint monotonically.
     /// A boundary that admits one down form cannot pay for an unused second
     /// form, and adding the first expert of that form pays its exact bytes.
@@ -6480,6 +7058,13 @@ mod tests {
                 need.bytes(),
                 "{how:?}: the classes sum to the need"
             );
+            let reading = HostNeed {
+                read_ahead: 17,
+                ..need
+            };
+            let with_reads = reading.classes(&plan, how).expect("a load's read reserve");
+            assert_eq!(with_reads.anon, got.anon + 17);
+            assert_eq!(with_reads.bytes(), reading.bytes());
         }
         // The table: each term's class under both holdings.
         let locked = Hosting {
@@ -6503,6 +7088,7 @@ mod tests {
                 (PageClass::Cache, PageClass::Cache),
                 (PageClass::Cache, PageClass::Cache),
                 (PageClass::Cache, PageClass::Locked),
+                (PageClass::Anon, PageClass::Anon),
                 (PageClass::Anon, PageClass::Pinned),
                 (PageClass::Unified, PageClass::Unified),
             ]
@@ -7710,11 +8296,11 @@ mod tests {
     }
 
     /// The row room counts the pages a row sits on, in the host's base page:
-    /// a 90 B row sits on two pages of 4,096 B and on two of 16,384 B (it
-    /// straddles a page boundary in both), so the room of a call of 4,096
-    /// positions reading 16 rows a position is 4,096 · 16 · 2 · page —
+    /// a 90 B row can straddle a page boundary at 4, 16 or 64 KiB, so the
+    /// room of a call of 4,096 positions reading 16 rows a position is
+    /// 4,096 · 16 · 2 · page —
     /// 536,870,912 B on this workstation's page and 2,147,483,648 B on the
-    /// 16 KiB one.
+    /// 16 KiB one, and 8,589,934,592 B on the 64 KiB one.
     #[test]
     fn the_row_room_counts_the_hosts_base_page() {
         let model = ModelTensors {
@@ -7737,6 +8323,7 @@ mod tests {
             let room = |page| row_room(&model, 4096, page, source).expect("the row room");
             assert_eq!(room(4096), 536_870_912);
             assert_eq!(room(16384), 2_147_483_648);
+            assert_eq!(room(65536), 8_589_934_592);
         }
 
         let mut model = model;
@@ -7764,7 +8351,7 @@ mod tests {
             (RowTableSource::Split, 536_870_912),
             (RowTableSource::Parts, 1_073_741_824),
         ] {
-            for page in [4096, 16384] {
+            for page in [4096, 16384, 65536] {
                 assert_eq!(
                     row_room(&model, 4096, page, source).unwrap(),
                     want * (page / 4096)

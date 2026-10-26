@@ -38,7 +38,7 @@
 //!    names that layer and the kernel's site, the values the planted input
 //!    reaches are not finite, every other value is the clean launch's bit
 //!    for bit, and the word is clean before and after.
-//! 8. `shape`: the ten entries compile with no local depot.
+//! 8. `shape`: the fourteen entries compile with no local depot.
 //! 9. `kda` (Kimi Delta Attention at GLM-5.3-Flash's shape: 64 query/key and
 //!    64 value heads, ε 1e-5, bound −5): `kda_conv_prep` at 512 and 1 tokens
 //!    over a random ring against its host rule; its `y`, β and ring against
@@ -88,8 +88,37 @@
 //! 15. `sp2 fault`: a NaN and an infinite forget value and an infinite β
 //!     projection in `kda_conv_prep_sp2`, a NaN gate and an infinite gate in the out gate,
 //!     judged as clause 7.
+//! 16. `prompt` (`enqueue_delta_prompt` at K1's shape over clause 12's lanes,
+//!     the lane word on lane 2): in place over 16, 1,000 and 4,096 tokens
+//!     (the chunked form), and over 4,096 whose keys of a head lie near one
+//!     direction with β and the decays near 1 (where the chunk's inverse
+//!     cancels hardest), `o` within [`PROMPT_BAND`] of the one-lane rule and
+//!     lane 2 within it of the rule at the call's last whole chunk, every
+//!     other lane untouched, lane 2's stamp moved to the position after the
+//!     call and the others kept, no fault, and a second launch the same bits;
+//!     a prompt cut into calls, each on the lanes, stamps and carry the one
+//!     before left, the same bits as one call (`o`, every lane, the stamps and
+//!     the carry): 16 tokens cut in two halves with every key and query head
+//!     e₀, every value 0.1, β 0.5 and the decays 0.99 from zero lanes, and
+//!     100 tokens cut at 50 and at 1, 2, 17, 32, 40, 41 and 77; a step after
+//!     the last, on the four rows its carry holds, the one-lane rule's bits
+//!     over them and its token; lane 2's stamp one past the call's first
+//!     position raising `delta_stamp` and a NaN value raising `linear_delta`
+//!     with what it reaches non-finite (its column of `o` from its chunk's
+//!     first row on and of lane 2's state) and every other value the clean
+//!     launch's, judged as clause 7; the launcher's refusals of a short
+//!     record buffer, a carry one short and q·k·v rows one short of the call;
+//!     and the four delta launchers' refusals, before launch, of a q·k·v,
+//!     state or carry window 4, 8 or 12 bytes past a 16-byte boundary.
 //!
-//! One case runs only when named, `--case kda_ik`, and alone: per KDA layer of
+//! 17. `recovery`: a four-row verify preserves its committed base and leaves
+//!     the chosen prefix's state and stamp equal to the scalar rule, for
+//!     zero through four kept rows, a wrapped lane and a prompt carry, both
+//!     eager and captured. Invalid row counts, lanes and overflowing sizes
+//!     are refused before launch. `--case recovery` runs this clause alone
+//!     with a development kernel bench over 32 stores.
+//!
+//! The `--case kda_ik` case runs alone: per KDA layer of
 //! the `ref_glm5next` set, the KDA conv and prep on ik's own inputs against
 //! ik's convolved, normed q·k·v, β and decay, the KDA delta on ik's own
 //! inputs against `attn_output` and `new_state`, and the sigmoid norm on ik's
@@ -109,15 +138,16 @@ mod gate {
         kda_conv_prep_host,
     };
     use bloomery_gpu::linear::delta::{
-        DeltaArgs, DeltaLanesArgs, DeltaOut, KdaLanesArgs, delta_host, kda_delta_host,
+        DeltaArgs, DeltaLanesArgs, DeltaOut, KdaLanesArgs, NEVER, delta_host, kda_delta_host,
+        prompt_work_len,
     };
     use bloomery_gpu::linear::norm_gate::{NormGateArgs, norm_gate_host};
     use bloomery_gpu::linear::out_gate::{OutGateArgs, out_gate_host};
     use bloomery_gpu::linear::{
-        CONV_TAPS, GATE_SIGMOID, GATE_SILU, HEAD, KHeadMap, LinearKernels, LinearShape, PASS_ROWS,
-        Q_SCALE, RING_ROWS, expf_ik, logf_poly, sigmoid,
+        CARRY_ROWS, CHUNK_ROWS, CONV_TAPS, GATE_SIGMOID, GATE_SILU, HEAD, KHeadMap, LinearKernels,
+        LinearShape, PASS_ROWS, Q_SCALE, RING_ROWS, expf_ik, logf_poly, sigmoid,
     };
-    use bloomery_gpu::{Fault, FaultSink, FaultSite, Gpu};
+    use bloomery_gpu::{Fault, FaultSink, FaultSite, Gpu, Window, WindowMut};
     use bloomery_gpu_gates::{
         GateError, RefManifest, bits_equal, checks_failed, max_ulps, no_local_depot,
         ref_tensor_logical_in, same_bits, split_f32, verdict,
@@ -438,16 +468,34 @@ mod gate {
         }
 
         /// One `gdn_delta_lanes` launch of `m` tokens at K1's shape on a
-        /// [`ROW_LANES`]-lane state holding `state` with `stamp`; `o`, the
-        /// state and the stamps after it.
+        /// [`ROW_LANES`]-lane state holding `state` with `stamp`, or with
+        /// `work` words an `enqueue_delta_prompt` call from a zero carry;
+        /// `o`, the state and the stamps after it.
         fn delta_lanes(
             &self,
             fault: FaultSink,
             st: &Step,
             (state, stamp): (&[f32], &[u32]),
-            call: LaneCall,
+            (call, work): (LaneCall, Option<usize>),
             m: usize,
         ) -> Result<(DeltaOut, Vec<u32>), GateError> {
+            let (d, sp, _) =
+                self.delta_carried(fault, st, (state, stamp, None), (call, work, false), m)?;
+            Ok((d, sp))
+        }
+
+        /// [`Ctx::delta_lanes`] with `carry` beside the state (none for
+        /// `gdn_delta_lanes`, a zero one for the prompt form, when `None`);
+        /// the carry after it too (empty without one). `recovery` selects
+        /// the record/replay entry, with no prompt `work`.
+        fn delta_carried(
+            &self,
+            fault: FaultSink,
+            st: &Step,
+            (state, stamp, carry): (&[f32], &[u32], Option<&[f32]>),
+            (call, work, recovery): (LaneCall, Option<usize>, bool),
+            m: usize,
+        ) -> Result<(DeltaOut, Vec<u32>, Vec<f32>), GateError> {
             let s = self.stream();
             let qkv = DeviceBuffer::from_host(s, &st.qkv)?;
             let beta = DeviceBuffer::from_host(s, &st.beta)?;
@@ -457,27 +505,42 @@ mod gate {
             let mut o = DeviceBuffer::from_host(s, &vec![0.0f32; m * K1_SHAPE.n_v * HEAD])?;
             let mut sd = DeviceBuffer::from_host(s, state)?;
             let mut sp = DeviceBuffer::from_host(s, stamp)?;
-            self.k.delta.enqueue_delta_lanes(
-                s,
-                DeltaLanesArgs {
-                    delta: DeltaArgs {
-                        qkv: &qkv,
-                        beta: &beta,
-                        decay: &decay,
-                        lane: &lw,
-                        lane_at: 1,
-                        lanes: ROW_LANES,
-                        shape: K1_SHAPE,
-                        m,
-                        fault,
-                        o: &mut o,
-                        state: &mut sd,
-                    },
-                    each: call.each,
-                    pos: &pd,
-                    stamp: &mut sp,
+            let args = DeltaLanesArgs {
+                delta: DeltaArgs {
+                    qkv: &qkv,
+                    beta: &beta,
+                    decay: &decay,
+                    lane: &lw,
+                    lane_at: 1,
+                    lanes: ROW_LANES,
+                    shape: K1_SHAPE,
+                    m,
+                    fault,
+                    o: &mut o,
+                    state: &mut sd,
                 },
-            )?;
+                each: call.each,
+                pos: &pd,
+                stamp: &mut sp,
+            };
+            let zero = vec![0.0f32; K1_SHAPE.carry_len()];
+            let mut cd = match (carry, work) {
+                (Some(c), _) => Some(DeviceBuffer::from_host(s, c)?),
+                (None, Some(_)) => Some(DeviceBuffer::from_host(s, &zero)?),
+                (None, None) => None,
+            };
+            match (recovery, work, cd.as_mut()) {
+                (true, _, cd) => {
+                    self.k
+                        .delta
+                        .enqueue_delta_recovery(s, args, cd.map(|c| &*c))?;
+                }
+                (false, Some(n), Some(cd)) => {
+                    let mut w = DeviceBuffer::from_host(s, &vec![0u32; n])?;
+                    self.k.delta.enqueue_delta_prompt(s, args, cd, &mut w)?;
+                }
+                (false, _, cd) => self.k.delta.enqueue_delta_lanes(s, args, cd.map(|c| &*c))?,
+            }
             s.synchronize()?;
             Ok((
                 DeltaOut {
@@ -485,6 +548,10 @@ mod gate {
                     state: sd.to_host_vec(s)?,
                 },
                 sp.to_host_vec(s)?,
+                match cd {
+                    Some(c) => c.to_host_vec(s)?,
+                    None => Vec::new(),
+                },
             ))
         }
 
@@ -601,14 +668,20 @@ mod gate {
 
     pub fn run() -> Result<(), GateError> {
         let args: Vec<String> = std::env::args().skip(1).collect();
+        let recovery_only = args == ["--case", "recovery"];
         let ik_only = match args.iter().map(String::as_str).collect::<Vec<_>>()[..] {
             [] => false,
             ["--case", "kda_ik"] => true,
-            _ => return Err("usage: gate_linear [--case kda_ik]".into()),
+            ["--case", "recovery"] => false,
+            _ => return Err("usage: gate_linear [--case kda_ik|recovery]".into()),
         };
         let gpu = Gpu::new()?;
         let k = LinearKernels::load(gpu.context())?;
         let cx = Ctx { gpu: &gpu, k: &k };
+        if recovery_only {
+            let pass = recovery_clauses(&cx, true)?.into_iter().all(|p| p);
+            return if pass { Ok(()) } else { Err(checks_failed()) };
+        }
         if ik_only {
             println!("gate_linear --case kda_ik: device {}", gpu.device_name()?);
             let pass = kda_ik_band(&cx)?;
@@ -653,6 +726,10 @@ mod gate {
             "kda_delta",
             "gdn_norm_gate_sigmoid",
             "gdn_delta_lanes",
+            "gdn_delta_recovery",
+            "gdn_chunk_prepare",
+            "gdn_delta_prepared",
+            "gdn_carry_keep",
             "kda_delta_lanes",
             "kda_conv_prep_sp2",
             "attn_out_gate_sigmoid",
@@ -669,6 +746,9 @@ mod gate {
         for pass in lanes_clauses(&cx)? {
             tally(pass);
         }
+        for pass in recovery_clauses(&cx, false)? {
+            tally(pass);
+        }
         for pass in kda_lanes_clauses(&cx)? {
             tally(pass);
         }
@@ -676,6 +756,9 @@ mod gate {
             tally(pass);
         }
         for pass in sp2_fault_clauses(&cx)? {
+            tally(pass);
+        }
+        for pass in prompt_clauses(&cx)? {
             tally(pass);
         }
         let pass = failed == 0;
@@ -2446,6 +2529,257 @@ mod gate {
         Ok(out)
     }
 
+    /// Recovery preserves a verify's base and commits exactly its chosen prefix.
+    fn recovery_clauses(cx: &Ctx<'_>, bench: bool) -> Result<Vec<bool>, GateError> {
+        let s = cx.stream();
+        let m = ROW_LANES;
+        let len = K1_SHAPE.state_len();
+        let l = Layer::with(0x7265_636f, K1_SHAPE);
+        let tk = Tokens::with(m, 0x7265_6374, K1_SHAPE);
+        let st = Step::of(
+            &conv_host(
+                &l,
+                &tk,
+                &vec![0.0; K1_SHAPE.ring_len()],
+                &positions(0, m),
+                m,
+            ),
+            K1_SHAPE,
+        );
+        let qkv = DeviceBuffer::from_host(s, &st.qkv)?;
+        let beta = DeviceBuffer::from_host(s, &st.beta)?;
+        let decay = DeviceBuffer::from_host(s, &st.decay)?;
+        let pd = DeviceBuffer::from_host(s, &[40u32])?;
+        // A parked slot can commit after another slot rewrites the parameter word.
+        let commit_pos = DeviceBuffer::from_host(s, &[999u32])?;
+        let initial = Lcg(0x7265_6373).fill(ROW_LANES * len, -0.1, 0.1);
+        let mut out = Vec::new();
+        for c in [0usize, ROW_LANES - 1] {
+            for carried in [false, true] {
+                let lw = DeviceBuffer::from_host(s, &[c as u32])?;
+                let mut stamps = vec![NEVER; ROW_LANES];
+                stamps[c] = 40;
+                let (initial, stamps, carry) = if carried {
+                    let mut before_stamps = stamps.clone();
+                    before_stamps[c] = 37;
+                    let (d, sp, carry) = cx.delta_carried(
+                        cx.gpu.unlabelled_sink(),
+                        &st.slice(0, 3),
+                        (&initial, &before_stamps, None),
+                        (
+                            LaneCall {
+                                lane: c as u32,
+                                p0: 37,
+                                each: false,
+                            },
+                            Some(prompt_work_len(K1_SHAPE, 3)),
+                            false,
+                        ),
+                        3,
+                    )?;
+                    (d.state, sp, Some(carry))
+                } else {
+                    (initial.clone(), stamps, None)
+                };
+                let cd = carry
+                    .as_ref()
+                    .map(|c| DeviceBuffer::from_host(s, c))
+                    .transpose()?;
+                let state0 = match &carry {
+                    Some(carry) => bloomery_gpu::linear::delta::carry_fold_host(
+                        carry,
+                        &initial[c * len..(c + 1) * len],
+                        40,
+                        K1_SHAPE,
+                    ),
+                    None => initial[c * len..(c + 1) * len].to_vec(),
+                };
+                let enqueue = |stream: &CudaStream,
+                               (recovery, each, rows): (bool, bool, usize),
+                               state: &mut DeviceBuffer<f32>,
+                               stamp: &mut DeviceBuffer<u32>,
+                               o: &mut DeviceBuffer<f32>| {
+                    let args = DeltaLanesArgs {
+                        delta: DeltaArgs {
+                            qkv: &qkv,
+                            beta: &beta,
+                            decay: &decay,
+                            lane: &lw,
+                            lane_at: 0,
+                            lanes: ROW_LANES,
+                            shape: K1_SHAPE,
+                            m: rows,
+                            fault: cx.gpu.unlabelled_sink(),
+                            o,
+                            state,
+                        },
+                        each,
+                        pos: if recovery && !each { &commit_pos } else { &pd },
+                        stamp,
+                    };
+                    if recovery {
+                        cx.k.delta.enqueue_delta_recovery(stream, args, cd.as_ref())
+                    } else {
+                        cx.k.delta.enqueue_delta_lanes(stream, args, cd.as_ref())
+                    }
+                };
+                if c == 0 && !carried {
+                    let mut state = DeviceBuffer::from_host(s, &initial)?;
+                    let mut stamp = DeviceBuffer::from_host(s, &stamps)?;
+                    let mut o = DeviceBuffer::zeroed(s, m * K1_SHAPE.n_v * HEAD)?;
+                    for (rows, lanes, lane_at, shape, named) in [
+                        (0, ROW_LANES, 0, K1_SHAPE, "m=0"),
+                        (1, 2, 0, K1_SHAPE, "3 or more lanes"),
+                        (ROW_LANES + 1, ROW_LANES, 0, K1_SHAPE, "rows <="),
+                        (1, ROW_LANES, usize::MAX, K1_SHAPE, "overflows"),
+                        (
+                            1,
+                            ROW_LANES,
+                            0,
+                            LinearShape {
+                                n_k: usize::MAX,
+                                n_v: usize::MAX,
+                                ..K1_SHAPE
+                            },
+                            "overflows",
+                        ),
+                    ] {
+                        let args = DeltaLanesArgs {
+                            delta: DeltaArgs {
+                                qkv: &qkv,
+                                beta: &beta,
+                                decay: &decay,
+                                lane: &lw,
+                                lane_at,
+                                lanes,
+                                shape,
+                                m: rows,
+                                fault: cx.gpu.unlabelled_sink(),
+                                o: &mut o,
+                                state: &mut state,
+                            },
+                            each: true,
+                            pos: &pd,
+                            stamp: &mut stamp,
+                        };
+                        let got = cx.k.delta.enqueue_delta_recovery(s, args, None);
+                        let pass = matches!(&got, Err(e) if e.to_string().contains(named));
+                        println!(
+                            "recovery refuses rows={rows} lanes={lanes} lane_at={lane_at}: {got:?} {}",
+                            verdict(pass)
+                        );
+                        out.push(pass);
+                    }
+                }
+                let want = delta_host(&st.qkv, &st.beta, &st.decay, &state0, 1, 0, K1_SHAPE, m);
+                for kept in 0..=m {
+                    for graph in [false, true] {
+                        let mut state = DeviceBuffer::from_host(s, &initial)?;
+                        let mut stamp = DeviceBuffer::from_host(s, &stamps)?;
+                        let mut o = DeviceBuffer::zeroed(s, m * K1_SHAPE.n_v * HEAD)?;
+                        let launch = |stream: &CudaStream| {
+                            enqueue(stream, (true, true, m), &mut state, &mut stamp, &mut o)
+                        };
+                        if graph {
+                            let g = cx.gpu.capture(launch)?;
+                            g.launch(s)?;
+                        } else {
+                            let mut launch = launch;
+                            launch(s)?;
+                        }
+                        let verified = o.to_host_vec(s)?;
+                        let before = state.to_host_vec(s)?;
+                        let unchanged = bits_equal(
+                            &before[c * len..(c + 1) * len],
+                            &initial[c * len..(c + 1) * len],
+                        );
+                        if kept != 0 {
+                            if graph {
+                                let g = cx.gpu.capture(|stream| {
+                                    enqueue(
+                                        stream,
+                                        (true, false, kept),
+                                        &mut state,
+                                        &mut stamp,
+                                        &mut o,
+                                    )
+                                })?;
+                                g.launch(s)?;
+                            } else {
+                                enqueue(s, (true, false, kept), &mut state, &mut stamp, &mut o)?;
+                            }
+                        }
+                        let got = state.to_host_vec(s)?;
+                        let committed = if kept == 0 {
+                            initial[c * len..(c + 1) * len].to_vec()
+                        } else {
+                            delta_host(&st.qkv, &st.beta, &st.decay, &state0, 1, 0, K1_SHAPE, kept)
+                                .state
+                        };
+                        let sp = stamp.to_host_vec(s)?;
+                        let target = if kept == 0 {
+                            c
+                        } else {
+                            (c + kept - 1) % ROW_LANES
+                        };
+                        let pass = unchanged
+                            && bits_equal(&verified, &want.o)
+                            && bits_equal(&got[target * len..(target + 1) * len], &committed)
+                            && sp[target] == 40 + kept as u32;
+                        println!(
+                            "recovery lane={c} kept={kept}/{m} graph={graph} carry={carried} base_unchanged={unchanged} {}",
+                            verdict(pass)
+                        );
+                        out.push(pass);
+                    }
+                }
+                if bench && c == 0 && !carried {
+                    let mut stores = (0..32)
+                        .map(|_| {
+                            Ok((
+                                DeviceBuffer::zeroed(s, ROW_LANES * len)?,
+                                DeviceBuffer::from_host(s, &stamps)?,
+                            ))
+                        })
+                        .collect::<Result<Vec<_>, GateError>>()?;
+                    let mut o = DeviceBuffer::zeroed(s, m * K1_SHAPE.n_v * HEAD)?;
+                    let timed = Some(cuda_core::sys::CUevent_flags_enum_CU_EVENT_DEFAULT);
+                    let start = cx.gpu.context().new_event(timed)?;
+                    let end = cx.gpu.context().new_event(timed)?;
+                    for round in 0..4 {
+                        for recovery in if round % 2 == 0 {
+                            [false, true]
+                        } else {
+                            [true, false]
+                        } {
+                            for (state, stamp) in &mut stores {
+                                state.zero_async(s)?;
+                                stamp.copy_from_host(s, &stamps)?;
+                            }
+                            s.synchronize()?;
+                            start.record(s)?;
+                            for (state, stamp) in &mut stores {
+                                enqueue(s, (recovery, true, m), state, stamp, &mut o)?;
+                            }
+                            if recovery {
+                                for (state, stamp) in &mut stores {
+                                    enqueue(s, (true, false, m), state, stamp, &mut o)?;
+                                }
+                            }
+                            end.record(s)?;
+                            end.synchronize()?;
+                            println!(
+                                "recovery bench layers=32 rows={m} kept={m} round={round} recovery={recovery} ms={}",
+                                start.elapsed_ms(&end)?
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        Ok(out)
+    }
+
     /// Clause 12: `gdn_delta_lanes` against the one-lane rule.
     fn lanes_clauses(cx: &Ctx<'_>) -> Result<Vec<bool>, GateError> {
         let unl = cx.gpu.unlabelled_sink();
@@ -2473,7 +2807,7 @@ mod gate {
                 p0,
                 each: false,
             };
-            let (d, sp) = cx.delta_lanes(unl, &t, (&lanes, &stamps), call, m)?;
+            let (d, sp) = cx.delta_lanes(unl, &t, (&lanes, &stamps), (call, None), m)?;
             let h = rule(&t, &lane_of(&lanes, c), m);
             let lane_c = lane_of(&d.state, c);
             let others = (0..ROW_LANES)
@@ -2500,7 +2834,7 @@ mod gate {
                 p0,
                 each: true,
             };
-            let (d, sp) = cx.delta_lanes(unl, &t, (&lanes, &stamps), call, m)?;
+            let (d, sp) = cx.delta_lanes(unl, &t, (&lanes, &stamps), (call, None), m)?;
             let (mut state, mut o) = (lane_of(&lanes, c), Vec::new());
             let (mut rows_same, mut want_state, mut want) = (true, lanes.clone(), stamps);
             for j in 0..m {
@@ -2533,15 +2867,15 @@ mod gate {
             p0,
             each: false,
         };
-        let (clean, _) = cx.delta_lanes(unl, &t, (&lanes, &stamps), call, m)?;
+        let (clean, _) = cx.delta_lanes(unl, &t, (&lanes, &stamps), (call, None), m)?;
         let layer = 32usize;
         let sink = cx.gpu.layer_sink(layer)?;
         let before = cx.gpu.fault()?;
         let mut stale = stamps;
         stale[c] = p0 + 1;
-        let (bad, _) = cx.delta_lanes(sink, &t, (&lanes, &stale), call, m)?;
+        let (bad, _) = cx.delta_lanes(sink, &t, (&lanes, &stale), (call, None), m)?;
         let word = cx.gpu.take_fault()?;
-        let _ = cx.delta_lanes(sink, &t, (&lanes, &stamps), call, m)?;
+        let _ = cx.delta_lanes(sink, &t, (&lanes, &stamps), (call, None), m)?;
         let after = cx.gpu.fault()?;
         out.push(
             Planted {
@@ -2564,7 +2898,7 @@ mod gate {
             p0,
             each: true,
         };
-        let got = cx.delta_lanes(unl, &t, (&lanes, &stamps), call, ROW_LANES + 1);
+        let got = cx.delta_lanes(unl, &t, (&lanes, &stamps), (call, None), ROW_LANES + 1);
         let named = matches!(&got, Err(e) if e.to_string().contains("row mode"));
         println!(
             "lanes launcher refuses row mode m={} over {ROW_LANES} lanes: \"{}\" {}",
@@ -2576,6 +2910,520 @@ mod gate {
             verdict(named)
         );
         out.push(named);
+        Ok(out)
+    }
+
+    /// The prompt clause's band on `‖ours − rule‖ / ‖rule‖` for `o` and the
+    /// state: the BF16 rounding of q, k, the state and the solved rows the
+    /// tensor cores take.
+    const PROMPT_BAND: f64 = 2e-2;
+
+    /// Clause 16: `enqueue_delta_prompt` against the one-lane rule.
+    fn prompt_clauses(cx: &Ctx<'_>) -> Result<Vec<bool>, GateError> {
+        const MOST: usize = 4096;
+        let unl = cx.gpu.unlabelled_sink();
+        let (len, ch, nv) = (K1_SHAPE.state_len(), K1_SHAPE.channels(), K1_SHAPE.n_v);
+        let l = Layer::with(0x7072_6f6d, K1_SHAPE);
+        let tk = Tokens::with(MOST, 0x7072_6f74, K1_SHAPE);
+        let zero_ring = vec![0.0f32; K1_SHAPE.ring_len()];
+        let st = Step::of(
+            &conv_host(&l, &tk, &zero_ring, &positions(0, MOST), MOST),
+            K1_SHAPE,
+        );
+        let lanes = Lcg(0x7072_6f6c).fill(ROW_LANES * len, -0.1, 0.1);
+        let (c, p0) = (2usize, 40u32);
+        let stamps = [7, 9, p0, 11];
+        let lane_of = |v: &[f32], i: usize| v[i * len..(i + 1) * len].to_vec();
+        let call = LaneCall {
+            lane: c as u32,
+            p0,
+            each: false,
+        };
+        // The least work a call of `m` tokens takes.
+        let prompt = |m: usize| (call, Some(prompt_work_len(K1_SHAPE, m)));
+        // Each key head's keys near one direction, β and the decays near 1:
+        // the chunk's inverse cancels hard.
+        let mut near = st.slice(0, MOST);
+        let mut r = Lcg(0x7072_6f6b);
+        let dir = r.fill(K1_SHAPE.n_k * HEAD, -1.0, 1.0);
+        for row in near.qkv.chunks_mut(ch) {
+            for (kh, key) in row[K1_SHAPE.n_k * HEAD..2 * K1_SHAPE.n_k * HEAD]
+                .chunks_mut(HEAD)
+                .enumerate()
+            {
+                for (x, &d) in key.iter_mut().zip(&dir[kh * HEAD..(kh + 1) * HEAD]) {
+                    *x = 0.85 * d + 0.15 * r.uniform(-1.0, 1.0);
+                }
+                let n = key.iter().map(|x| x * x).sum::<f32>().sqrt();
+                key.iter_mut().for_each(|x| *x /= n);
+            }
+        }
+        near.beta = r.fill(MOST * nv, 0.9, 1.0);
+        near.decay = r.fill(MOST * nv, 0.995, 1.0);
+        let mut out = Vec::new();
+
+        for (what, t) in [
+            ("", st.slice(0, CHUNK_ROWS)),
+            ("", st.slice(0, 1000)),
+            ("", st.slice(0, MOST)),
+            (", keys near one direction", near),
+        ] {
+            let m = t.beta.len() / nv;
+            let (d, sp) = cx.delta_lanes(unl, &t, (&lanes, &stamps), prompt(m), m)?;
+            let (again, _) = cx.delta_lanes(unl, &t, (&lanes, &stamps), prompt(m), m)?;
+            let word = cx.gpu.fault()?;
+            let rule = |m: usize| {
+                delta_host(
+                    &t.qkv,
+                    &t.beta,
+                    &t.decay,
+                    &lane_of(&lanes, c),
+                    LANES,
+                    0,
+                    K1_SHAPE,
+                    m,
+                )
+            };
+            // The lane stands at the last whole chunk; the carry holds the
+            // rows past it.
+            let (h, whole) = (rule(m), rule(m / CHUNK_ROWS * CHUNK_ROWS));
+            let lane_c = lane_of(&d.state, c);
+            let (ro, rs) = (rel_l2(&d.o, &h.o), rel_l2(&lane_c, &whole.state));
+            let others = (0..ROW_LANES)
+                .filter(|&i| i != c)
+                .all(|i| bits_equal(&lane_of(&d.state, i), &lane_of(&lanes, i)));
+            let mut want = stamps;
+            want[c] = p0 + m as u32;
+            let same = bits_equal(&d.o, &again.o) && bits_equal(&d.state, &again.state);
+            let pass = ro <= PROMPT_BAND
+                && rs <= PROMPT_BAND
+                && others
+                && sp == want
+                && word.is_none()
+                && same;
+            println!(
+                "prompt m={m}{what} on lane {c} of {ROW_LANES}: o rel_l2 {ro:.3e}, lane {c} at its \
+                 last whole chunk rel_l2 {rs:.3e} (band {PROMPT_BAND:.0e}), other lanes untouched \
+                 {others}, stamps {sp:?} (want {want:?}), no fault {}, a second launch the same \
+                 bits {same} {}",
+                word.is_none(),
+                verdict(pass)
+            );
+            out.push(pass);
+        }
+
+        // A fixed point of the delta rule must retain the state between BF16 values.
+        let mut fixed = st.slice(0, CHUNK_ROWS);
+        fixed.qkv.fill(0.0);
+        fixed.beta.fill(1.0);
+        fixed.decay.fill(1.0);
+        let value = 1.003_906_3f32;
+        let mut fixed_lanes = vec![0.0; ROW_LANES * len];
+        for row in fixed.qkv.chunks_mut(ch) {
+            for kh in 0..K1_SHAPE.n_k {
+                row[kh * HEAD] = 1.0;
+                row[(K1_SHAPE.n_k + kh) * HEAD] = 1.0;
+            }
+            row[2 * K1_SHAPE.n_k * HEAD..].fill(value);
+        }
+        for column in fixed_lanes[c * len..(c + 1) * len].chunks_mut(HEAD) {
+            column[0] = value;
+        }
+        let want = lane_of(&fixed_lanes, c);
+        for from in [value, 0.0] {
+            if from == 0.0 {
+                fixed_lanes.fill(0.0);
+            }
+            let (d, _) = cx.delta_lanes(
+                unl,
+                &fixed,
+                (&fixed_lanes, &stamps),
+                prompt(CHUNK_ROWS),
+                CHUNK_ROWS,
+            )?;
+            let error = rel_l2(&lane_of(&d.state, c), &want);
+            let pass = error < 1e-5;
+            println!(
+                "prompt fixed point between BF16 values from {from}: state rel_l2 {error:.3e} {}",
+                verdict(pass)
+            );
+            out.push(pass);
+        }
+
+        out.extend(cut_clauses(cx, &st, (&lanes, stamps), call)?);
+
+        // Lane 2's stamp one past the call's position, then a NaN value of
+        // head 5, column 70, token 37 (chunk 2, rows 32 on): what the word
+        // names and what the value reaches.
+        let m = 80;
+        let t = st.slice(0, m);
+        let (clean, _) = cx.delta_lanes(unl, &t, (&lanes, &stamps), prompt(m), m)?;
+        let (h_nan, c_nan, t_nan) = (5usize, 70usize, 37usize);
+        let mut bad_v = t.slice(0, m);
+        bad_v.qkv[t_nan * ch + 2 * K1_SHAPE.n_k * HEAD + h_nan * HEAD + c_nan] = f32::NAN;
+        let mut stale = stamps;
+        stale[c] = p0 + 1;
+        let o_hit: Vec<usize> = (t_nan / 16 * 16..m)
+            .map(|r| (r * nv + h_nan) * HEAD + c_nan)
+            .collect();
+        let s_hit: Vec<usize> = (0..HEAD)
+            .map(|i| c * len + (h_nan * HEAD + c_nan) * HEAD + i)
+            .collect();
+        for (layer, what, plant) in [
+            (
+                38usize,
+                "prompt stamp of lane 2 one past the call's position",
+                FaultSite::DeltaStamp,
+            ),
+            (39, "prompt NaN value", FaultSite::LinearDelta),
+        ] {
+            let sink = cx.gpu.layer_sink(layer)?;
+            let before = cx.gpu.fault()?;
+            let (input, stamp, hit) = if plant == FaultSite::DeltaStamp {
+                (&t, &stale, vec![vec![], vec![]])
+            } else {
+                (&bad_v, &stamps, vec![o_hit.clone(), s_hit.clone()])
+            };
+            let (bad, _) = cx.delta_lanes(sink, input, (&lanes, stamp), prompt(m), m)?;
+            let word = cx.gpu.take_fault()?;
+            cx.delta_lanes(sink, &t, (&lanes, &stamps), prompt(m), m)?;
+            let after = cx.gpu.fault()?;
+            out.push(
+                Planted {
+                    what,
+                    want: Fault::at(u32::try_from(layer)?, plant),
+                    before,
+                    word,
+                    after,
+                    hit,
+                    clean: vec![clean.o.clone(), clean.state.clone()],
+                    bad: vec![bad.o, bad.state],
+                }
+                .judge(),
+            );
+        }
+
+        let mut invalid = vec![0.0f32; K1_SHAPE.carry_len()];
+        invalid[0] = f32::from_bits((CARRY_ROWS + 1) as u32);
+        invalid[1] = f32::from_bits(p0);
+        for (layer, what, work, recovery) in [
+            (40usize, "prompt carry count 16", prompt(1).1, false),
+            (41, "lane carry count 16", None, false),
+            (42, "recovery carry count 16", None, true),
+        ] {
+            let call = LaneCall {
+                each: recovery,
+                ..call
+            };
+            let sink = cx.gpu.layer_sink(layer)?;
+            let before = cx.gpu.fault()?;
+            cx.delta_carried(
+                sink,
+                &st.slice(0, 1),
+                (&lanes, &stamps, Some(&invalid)),
+                (call, work, recovery),
+                1,
+            )?;
+            let word = cx.gpu.take_fault()?;
+            cx.delta_carried(
+                sink,
+                &st.slice(0, 1),
+                (&lanes, &stamps, None),
+                (call, work, recovery),
+                1,
+            )?;
+            let after = cx.gpu.fault()?;
+            out.push(
+                Planted {
+                    what,
+                    want: Fault::at(u32::try_from(layer)?, FaultSite::LinearDelta),
+                    before,
+                    word,
+                    after,
+                    hit: vec![],
+                    clean: vec![],
+                    bad: vec![],
+                }
+                .judge(),
+            );
+        }
+
+        // A record buffer shorter than the chunked form writes, a carry one
+        // short and q·k·v rows short of the call (the shared lane checks) are
+        // refused by name.
+        let m = CHUNK_ROWS;
+        let short = vec![0.0f32; K1_SHAPE.carry_len() - 1];
+        let work = prompt_work_len(K1_SHAPE, m);
+        for (what, rows, (work, carry), want) in [
+            ("a one-word record buffer", m, (1, None), "work.len() 1 <"),
+            (
+                "a carry one short",
+                m,
+                (work, Some(&short[..])),
+                "enqueue_delta_prompt: carry.len() ",
+            ),
+            (
+                "q·k·v rows one short",
+                m - 1,
+                (work, None),
+                "enqueue_delta_prompt: qkv.len() ",
+            ),
+        ] {
+            let got = cx.delta_carried(
+                unl,
+                &st.slice(0, rows),
+                (&lanes, &stamps, carry),
+                (call, Some(work), false),
+                m,
+            );
+            let named = matches!(&got, Err(e) if e.to_string().contains(want));
+            println!(
+                "prompt launcher refuses {what} at m={m}: \"{}\" {}",
+                match &got {
+                    Ok(_) => "launched".to_owned(),
+                    Err(e) => e.to_string(),
+                },
+                verdict(named)
+            );
+            out.push(named);
+        }
+        out.push(misaligned_refused(cx, &st, (&lanes, &stamps), call)?);
+        Ok(out)
+    }
+
+    /// Clause 16's alignment refusals: `enqueue_delta`, `enqueue_delta_lanes`,
+    /// `enqueue_delta_recovery` and `enqueue_delta_prompt` refuse by name a
+    /// q·k·v, state or carry window 4, 8 or 12 bytes past a 16-byte boundary,
+    /// each other buffer aligned, before launch: the kernels read the three
+    /// as 128-bit vectors, and the state and `o` are left as they were.
+    fn misaligned_refused(
+        cx: &Ctx<'_>,
+        st: &Step,
+        (state, stamp): (&[f32], &[u32]),
+        call: LaneCall,
+    ) -> Result<bool, GateError> {
+        const M: usize = 4;
+        let s = cx.stream();
+        let unl = cx.gpu.unlabelled_sink();
+        let st = st.slice(0, M);
+        // Three floats past each buffer's own length, room for any window start below 16 bytes.
+        let padded = |v: &[f32]| {
+            let mut p = v.to_vec();
+            p.extend([0.0; 3]);
+            DeviceBuffer::from_host(s, &p)
+        };
+        let carry_len = K1_SHAPE.carry_len();
+        let o_host = vec![0.0f32; M * K1_SHAPE.n_v * HEAD];
+        let qkv = padded(&st.qkv)?;
+        let mut sd = padded(state)?;
+        let mut cd = padded(&vec![0.0f32; carry_len])?;
+        let beta = DeviceBuffer::from_host(s, &st.beta)?;
+        let decay = DeviceBuffer::from_host(s, &st.decay)?;
+        let lw = DeviceBuffer::from_host(s, &[0xdead_beef, call.lane])?;
+        let pd = DeviceBuffer::from_host(s, &[call.p0])?;
+        let mut o = DeviceBuffer::from_host(s, &o_host)?;
+        let mut sp = DeviceBuffer::from_host(s, stamp)?;
+        let mut work = DeviceBuffer::from_host(s, &vec![0u32; prompt_work_len(K1_SHAPE, M)])?;
+        let mut pass = true;
+        for off in [4usize, 8, 12] {
+            for name in ["qkv", "state", "carry"] {
+                let at = |n: &str| if n == name { off } else { 0 };
+                for launcher in ["delta", "lanes", "recovery", "prompt"] {
+                    if launcher == "delta" && name == "carry" {
+                        continue;
+                    }
+                    let q = Window::<f32>::of(&qkv, at("qkv"), st.qkv.len())?;
+                    let mut sw = WindowMut::<f32>::of_mut(&mut sd, at("state"), state.len())?;
+                    let mut c = WindowMut::<f32>::of_mut(&mut cd, at("carry"), carry_len)?;
+                    let delta = DeltaArgs {
+                        qkv: &q,
+                        beta: &beta,
+                        decay: &decay,
+                        lane: &lw,
+                        lane_at: 1,
+                        lanes: if launcher == "delta" { 1 } else { ROW_LANES },
+                        shape: K1_SHAPE,
+                        m: M,
+                        fault: unl,
+                        o: &mut o,
+                        state: &mut sw,
+                    };
+                    let got = if launcher == "delta" {
+                        cx.k.delta.enqueue_delta(s, delta)
+                    } else {
+                        let args = DeltaLanesArgs {
+                            delta,
+                            each: false,
+                            pos: &pd,
+                            stamp: &mut sp,
+                        };
+                        match launcher {
+                            "lanes" => cx.k.delta.enqueue_delta_lanes(s, args, Some(&*c)),
+                            "recovery" => cx.k.delta.enqueue_delta_recovery(s, args, Some(&*c)),
+                            _ => cx.k.delta.enqueue_delta_prompt(s, args, &mut c, &mut work),
+                        }
+                    };
+                    let named = matches!(&got, Err(e) if e.to_string().contains(&format!("{name} at "))
+                        && e.to_string().contains("is not 16-byte aligned"));
+                    println!(
+                        "{launcher} launcher refuses {name} {off} bytes past 16: \"{}\" {}",
+                        match &got {
+                            Ok(()) => "launched".to_owned(),
+                            Err(e) => e.to_string(),
+                        },
+                        verdict(named)
+                    );
+                    pass &= named;
+                }
+            }
+        }
+        s.synchronize()?;
+        let mut held = state.to_vec();
+        held.extend([0.0; 3]);
+        let untouched = sd.to_host_vec(s)? == held && o.to_host_vec(s)? == o_host;
+        println!(
+            "the refused launches leave the state and o as they were {}",
+            verdict(untouched)
+        );
+        Ok(pass && untouched)
+    }
+
+    /// Clause 16's cuts: a prompt run as calls cut at chosen rows (the
+    /// prompt form each, a call on the lanes, stamps and carry the call
+    /// before it left) against the same prompt as one call, bit for bit: `o`,
+    /// every lane, the stamps and the carry. Then a step after a cut prompt
+    /// that ends inside a chunk, on its carry, against the one-lane rule over
+    /// the carried rows and the step's token from the lane the prompt left.
+    fn cut_clauses(
+        cx: &Ctx<'_>,
+        st: &Step,
+        (lanes, stamps): (&[f32], [u32; ROW_LANES]),
+        call: LaneCall,
+    ) -> Result<Vec<bool>, GateError> {
+        type Left = (Vec<f32>, Vec<f32>, Vec<u32>, Vec<f32>);
+        const M: usize = 100;
+        let unl = cx.gpu.unlabelled_sink();
+        let (len, ch, nv, nk) = (
+            K1_SHAPE.state_len(),
+            K1_SHAPE.channels(),
+            K1_SHAPE.n_v,
+            K1_SHAPE.n_k,
+        );
+        let c = call.lane as usize;
+        let lane_of = |v: &[f32], i: usize| v[i * len..(i + 1) * len].to_vec();
+        // `t` from `lanes` and a zero carry in calls cut at `cuts`: every
+        // call's `o`, then the lanes, stamps and carry the last one leaves.
+        let run = |t: &Step, lanes: &[f32], cuts: &[usize]| -> Result<Left, GateError> {
+            let m = t.beta.len() / nv;
+            let mut left: Left = (
+                Vec::new(),
+                lanes.to_vec(),
+                stamps.to_vec(),
+                vec![0.0; K1_SHAPE.carry_len()],
+            );
+            let mut at = 0;
+            for end in cuts.iter().copied().chain([m]) {
+                let n = end - at;
+                let call = LaneCall {
+                    p0: call.p0 + u32::try_from(at)?,
+                    ..call
+                };
+                let (d, sp, carry) = cx.delta_carried(
+                    unl,
+                    &t.slice(at, n),
+                    (&left.1, &left.2, Some(&left.3)),
+                    (call, Some(prompt_work_len(K1_SHAPE, n)), false),
+                    n,
+                )?;
+                left.0.extend(d.o);
+                (left.1, left.2, left.3) = (d.state, sp, carry);
+                at = end;
+            }
+            Ok(left)
+        };
+        // The scalar case a split into two units of eight once moved: every
+        // key and query head e₀, every value 0.1, β 0.5 and the decays 0.99,
+        // from zero lanes.
+        let mut row = vec![0.0f32; ch];
+        for kh in 0..nk {
+            row[kh * HEAD] = 1.0;
+            row[(nk + kh) * HEAD] = 1.0;
+        }
+        row[2 * nk * HEAD..].fill(0.1);
+        let scalar = Step {
+            qkv: row.repeat(CHUNK_ROWS),
+            beta: vec![0.5; CHUNK_ROWS * nv],
+            decay: vec![0.99; CHUNK_ROWS * nv],
+            ch,
+            nv,
+            dn: nv,
+        };
+        let zero = vec![0.0f32; ROW_LANES * len];
+        // Every unit width from one row to more than two chunks, cuts inside
+        // a chunk and on its edge, and a unit inside one chunk.
+        let ragged = [1, 2, 17, 32, 40, 41, 77];
+        let mut out = Vec::new();
+        for (what, t, from, cuts) in [
+            (", the scalar case", &scalar, &zero[..], &[8][..]),
+            ("", &st.slice(0, M), lanes, &[50][..]),
+            ("", &st.slice(0, M), lanes, &ragged[..]),
+        ] {
+            let one = run(t, from, &[])?;
+            let cut = run(t, from, cuts)?;
+            let pass = bits_equal(&cut.0, &one.0)
+                && bits_equal(&cut.1, &one.1)
+                && cut.2 == one.2
+                && bits_equal(&cut.3, &one.3);
+            println!(
+                "prompt of {} cut at {cuts:?} vs one call{what}: o {} lanes {} stamps {} carry {} {}",
+                t.beta.len() / nv,
+                cmp(&cut.0, &one.0),
+                cmp(&cut.1, &one.1),
+                cut.2 == one.2,
+                cmp(&cut.3, &one.3),
+                verdict(pass)
+            );
+            out.push(pass);
+        }
+        // M ends four rows into a chunk: the step takes them first.
+        let (_, state, stamp, carry) = run(&st.slice(0, M), lanes, &ragged)?;
+        let step = LaneCall {
+            p0: call.p0 + u32::try_from(M)?,
+            ..call
+        };
+        let (d, sp, _) = cx.delta_carried(
+            unl,
+            &st.slice(M, 1),
+            (&state, &stamp, Some(&carry)),
+            (step, None, false),
+            1,
+        )?;
+        let held = M % CHUNK_ROWS;
+        let t = st.slice(M - held, held + 1);
+        let h = delta_host(
+            &t.qkv,
+            &t.beta,
+            &t.decay,
+            &lane_of(&state, c),
+            LANES,
+            0,
+            K1_SHAPE,
+            held + 1,
+        );
+        let lane_c = lane_of(&d.state, c);
+        let o_last = &h.o[held * nv * HEAD..];
+        let mut want = stamp.clone();
+        want[c] = step.p0 + 1;
+        let pass = bits_equal(&d.o, o_last) && bits_equal(&lane_c, &h.state) && sp == want;
+        println!(
+            "a step after the prompt of {M} cut at {ragged:?}, on its carry of {held} rows: o {} \
+             lane {c} {} (the one-lane rule over the carried rows and the token), stamps {sp:?} \
+             (want {want:?}) {}",
+            cmp(&d.o, o_last),
+            cmp(&lane_c, &h.state),
+            verdict(pass)
+        );
+        out.push(pass);
         Ok(out)
     }
 

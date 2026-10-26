@@ -31,6 +31,9 @@ generate_ds41   bf16_gemv                                0           0
 generate_ds41   bf16_gemv_ids                            0           0
 generate_ds41   bf16_mma_cols_gemm                       0           0
 generate_ds41   bf16_mma_gemm                            0           0
+# PIN(2026-10-25): the new entry uses sm_86 ptxas 13.3.73 spill/stack (0/0). The cc 8.6 JIT was not measured (the GB10
+# JIT reads 160 B of local for this PTX); this new entry's jit_local pin uses the measured ptxas stack frame.
+generate_ds41   bf16_mma_norm_gate                       0           0
 generate_ds41   bf16_tile_gemm                           0           0
 generate_ds41   cand_block_max                           0           0
 generate_ds41   cand_compact                             0           0
@@ -145,9 +148,13 @@ generate_ds41   gap_coop_sync                            0           0
 generate_ds41   gap_plain                                0           0
 generate_ds41   gate_up_swiglu_q3k                       0           0
 generate_ds41   gather_pairs                             0           0
+generate_ds41   gdn_carry_keep                           0           0
+generate_ds41   gdn_chunk_prepare                        0           0
 generate_ds41   gdn_conv_prep                            0           0
 generate_ds41   gdn_delta                                0           0
 generate_ds41   gdn_delta_lanes                          0           0
+generate_ds41   gdn_delta_recovery                       0           0
+generate_ds41   gdn_delta_prepared                       0           0
 generate_ds41   gdn_norm_gate                            0           0
 generate_ds41   gdn_norm_gate_sigmoid                    0           0
 generate_ds41   geglu_tanh                               0           0
@@ -185,7 +192,6 @@ generate_ds41   gemm_route_remap                         0           0
 generate_ds41   gemm_swiglu_quant                        0           0
 generate_ds41   glm5next_router                          0           0
 generate_ds41   glm5next_router_pick                     0           0
-generate_ds41   gqa_flash_fold_mma_256_p12_sel           0           0
 generate_ds41   gqa_flash_merge                          0           0
 generate_ds41   gqa_flash_merge_256                      0           0
 generate_ds41   gqa_flash_merge_h128_swa                0           0
@@ -213,7 +219,10 @@ generate_ds41   gqa_prefill_flash_256                    0           0
 generate_ds41   gqa_prefill_flash_256_p1_lower           0           0
 generate_ds41   gqa_prefill_flash_256_p2                 0           0
 generate_ds41   gqa_prefill_flash_256_p2_lower           0           0
+generate_ds41   gqa_prefill_flash_256_p12_sel            0           0
+generate_ds41   gqa_prefill_flash_256_p12_sel_gated      0           0
 generate_ds41   gqa_prefill_flash_256_p4                 0           0
+generate_ds41   gqa_prefill_flash_256_p4_gated           0           0
 generate_ds41   gqa_prefill_flash_256_q8                 0           0
 generate_ds41   gqa_prefill_flash_512_p4                 0           0
 generate_ds41   gqa_prefill_flash_512_p4_lower           0           0
@@ -253,7 +262,12 @@ generate_ds41   hc_gated_up_mix_4x320                    0           0
 # release batch's A6000, driver 615.71.09); 176 was its reading of the body before that replay (1352 spill bytes), kept
 # through the 484 step. The spill pin stands (484 read again). The entry launches only where dense_mma holds, cc 12.1
 # (q8f32.rs Q8F32Kernels::load), so these cc 8.6 bytes are never run.
-generate_ds41   hc_gated_up_mma_mix_4                  484         104
+# PIN(2026-10-25): HC up BF16 input: sm_86 spill 484 -> 608 B, GB10 JIT local unchanged at 88 B; native sm_121/sm_121a spill 364 -> 332 B; deferred flags and u32 columns each measured 532 B spill / 96 B JIT local.
+# The cc 8.6 JIT was not measured; its historical 104 B pin is retained.
+generate_ds41   hc_gated_up_mma_mix_4                  608         104
+# PIN(2026-10-25): the new entry uses sm_86 ptxas 13.3.73 spill/stack (676/192). The cc 8.6 JIT was not measured (the
+# GB10 JIT reads 88 B of local for this PTX); this new entry's jit_local pin uses the measured ptxas stack frame.
+generate_ds41   hc_gated_up_mma_mix_4_bf16             676         192
 generate_ds41   hc_gated_up_mix_bf16_1col                0           0
 generate_ds41   hc_gated_up_mix_bf16_4x320               0           0
 generate_ds41   hc_pre_q8_0                              0           0
@@ -336,8 +350,10 @@ generate_ds41   neox_append_k192                         0           0
 generate_ds41   neox_append_k192_ring                    0           0
 generate_ds41   norm_quant                               0           0
 generate_ds41   nvfp4_gate_up_sel                        0           0
+generate_ds41   nvfp4_gate_up_sel_cols                   0           0
 generate_ds41   nvfp4_gemv                               0           0
 generate_ds41   nvfp4_gemv_sel32                         0           0
+generate_ds41   nvfp4_gemv_sel32_cols                    0           0
 # PIN(2026-10-23): nvfp4_gemv_sel_f32: sm_86 ptxas measured; cc 8.6 driver JIT not measured.
 generate_ds41   nvfp4_gemv_sel_f32                       0           0
 generate_ds41   ple_conv                                 0           0
@@ -406,9 +422,11 @@ generate_ds41   quantize_gemm32                          0           0
 generate_ds41   qwen35moe_router_fused                   0           0
 generate_ds41   qwen35moe_router_fused_512               0           0
 generate_ds41   qwen35moe_router_fused_512_bf16          0           0
+generate_ds41   qwen35moe_router_fused_512_bf16_mma      0           0
 generate_ds41   qwen35moe_router_logits                  0           0
 generate_ds41   qwen35moe_router_logits_512              0           0
 generate_ds41   qwen35moe_router_logits_512_bf16         0           0
+generate_ds41   qwen35moe_router_logits_512_bf16_mma     0           0
 generate_ds41   qwen35moe_router_norm                    0           0
 generate_ds41   qwen35moe_router_norm_m                  0           0
 generate_ds41   qwen35moe_router_norm_m_prefetch         0           0
