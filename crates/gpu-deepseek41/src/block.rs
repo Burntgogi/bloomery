@@ -711,7 +711,15 @@ mod tests {
             [Mxfp8, Q8_0, Mxfp8],
             [Q4K, Mxfp8, Q4K],
         ] {
-            assert!(matches!(plan(types), Err(GpuError::Shape { .. })));
+            let Err(GpuError::Shape { what, detail }) = plan(types) else {
+                panic!(
+                    "{types:?}: incompatible activation forms were not refused as a shape error"
+                );
+            };
+            assert_eq!(what, WHAT);
+            for ty in types {
+                assert!(detail.contains(&ty.to_string()), "{types:?}: {detail}");
+            }
         }
     }
 

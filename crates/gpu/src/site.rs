@@ -1093,7 +1093,8 @@ pub fn gemm(
             k.gemm.enqueue_gemm(
                 stream,
                 GemmArgs {
-                    ty: gemm_weight(ty).ok_or(GpuError::state(WHAT, "a K-quant's GEMM type"))?,
+                    ty: gemm_weight(ty)
+                        .ok_or(GpuError::state(WHAT, "the selected site's GEMM type"))?,
                     w: match src {
                         SiteWeight::Words { w, .. } => w,
                         _ => kq(w, WHAT, name)?,
@@ -1746,7 +1747,15 @@ mod tests {
             ("shared", (2, 256), &[SiteTy::Q4K][..]),
             ("unsupported", (2, 256), SiteTy::ALL),
         ] {
-            assert!(file_site(&file, "test", name, shape, allowed).is_err());
+            let Err(chain::ChainError::Shape { what, detail }) =
+                file_site(&file, "test", name, shape, allowed)
+            else {
+                panic!(
+                    "{name}: invalid shape or launch admission was not refused as a shape error"
+                );
+            };
+            assert_eq!(what, "test");
+            assert!(detail.contains(name), "{name}: {detail}");
         }
     }
 

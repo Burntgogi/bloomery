@@ -137,7 +137,9 @@ bindings after it. This reads no payload and proves neither loading nor arithmet
 the ordinary `SharedExpert` layout, unequal matrix widths, one/eight-column block
 execution and the wide-prompt transition/captured replay. Wide scratch holds only
 the q8_1 input and down forms these sites read. Its nonnegative constant-weight
-case derives a scalar floating-operation bound; it is not a whole-model accuracy pin.
+case derives a scalar floating-operation bound; uniform codes do not detect nibble
+decode ordering. That remains a separate IQ4 kernel-gate obligation, not a
+whole-model accuracy pin or a claim made by this wrapper fixture.
 
 Existing program-specific admission remains unchanged: in particular the legacy
 Qwen projection/shared dispatch does not gain this site automatically. Flint's implemented
@@ -150,14 +152,11 @@ DS41 library on Hikari GPU0 (RTX3090 cc8.6, driver595.91.07):38 passed,0 failed,
 with repository patch31ab6a1d3f58 and LLVM21.1.8 were used.
 Its canonical comparison to main15778e2c covered4bins/8carriers/1657entries: all identical,
 non-JIT resource rows equal; no JIT-resource comparison is claimed.
-All-target native Clippy/formatting and current-head GitHub T0/lint passed.
-The original execution request5a907e86-7ac6-4219-a3b6-e3cf1de84e03 exited0 but credential
-cleanup remains unconfirmed; test success does not certify credential revocation.
-Raw logs and canonical manifests remain in the contribution workspace's
-`flint-closure-20261026` and its matching remote evidence directory. GPU1 was not stopped.
-Later documentation-only commits are not a new GPU execution. Wider affected real-model,
-placement and residency coverage remains explicit for maintainer review; #782 is review-ready,
-not merged, and this does not establish a Flint oracle, physical cc12.1, ROCm or performance.
+All-target native Clippy/formatting and source203f5125 GitHub T0/lint passed.
+These are source-specific historical results, not another hardware execution of
+later diagnostic, test or documentation changes. Wider affected real-model,
+placement and residency coverage remains explicit; this does not establish a
+Flint oracle, physical cc12.1, ROCm or performance.
 
 ### Selected expert arms and tier scratch
 
