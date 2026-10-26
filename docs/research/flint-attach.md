@@ -110,13 +110,19 @@ The real mixed-wrapper hardware case also checks allocation of a configured empt
 Historical exact-source proof at `3071a9f0d8ed4773692e0c040dece222b90f6bec`:
 GPU library418 passed plus10 held passed, verbs1 passed, and all1657 canonical entries
 identical to main15778e2c (4bins/8carriers, non-JIT rows equal).
-The newly repaired constructor and extended hardware case require their own source-specific
-execution; the PR was returned to Draft on the finding rather than relabel the earlier pass.
+The repair at `c26025b1fb9fad1af399401d27cf709005736ba0` then executed the extended
+real CUDA mixed/empty-tier consumer:1 passed,0 failed,0 ignored,427 filtered,24.18s.
+Its fresh4bin/8carrier canonical comparison again found all1657entries identical to main15778e2c,
+with non-JIT rows equal. Native formatting/Clippy passed (warning3=ratchet3); model557 and
+placement202 passed,0 failed,5 model tests ignored,0 filtered.
+Request75d4e06e-f3fb-4001-bcc4-e188c169edf5 exited0, credential cleanup unconfirmed;
+GPU1 remained active/healthy and was not stopped. The PR returned to review-ready only after
+this repair proof. Later documentation-only commits do not count as another hardware run.
 
-A host-only public planner consumer exercised the one-byte boundaries before the first resident layer
-and before adding the other down form, plus descriptor overflow refusal. This proves planning behavior,
-not device allocation or expert arithmetic. The existing CUDA leg, batch and tier gates still need an
-exact-head NVIDIA run. Flint's `Program` admission and body/app/seat remain absent.
+The host-only public planner consumer covers one-byte boundaries before the first resident layer
+and before adding another down form, plus descriptor overflow refusal. These and the CUDA consumer
+are not a whole-model oracle or every affected model/residency gate; canonical equality does not
+waive changed host/allocation consumers. Flint's `Program` admission and body/app/seat remain absent.
 
 
 
