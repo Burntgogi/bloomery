@@ -266,16 +266,6 @@ mod tests {
         let inputs = PlanInputs::describe(&split).expect("the synthetic header describes");
         let _ = std::fs::remove_file(&path);
         let hp = &inputs.hp;
-        assert_eq!(
-            tier_batch(hp, COLS),
-            workstation::tier_leg_batch_bytes(
-                hp.n_embd as u64,
-                hp.expert_ff as u64,
-                hp.n_used as u64,
-                TIER_CHUNK,
-                COLS,
-            )
-        );
         let routed = runtime::layer::hosted(&inputs.spec.layers).map_or(0, |run| run.len());
         let tiered = workstation::plan_bp(hp.n_trunk, None, tier_batch(hp, COLS));
         let plain = workstation::plan_gate(hp.n_trunk);

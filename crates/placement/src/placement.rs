@@ -6453,13 +6453,20 @@ mod tests {
         use workstation::{TIER_BATCH_RESERVE, try_tier_leg_batch_bytes_of};
 
         let both = DownForms::of(DownAct::Q8Act).with(DownAct::Q8Blocks32);
-        let batch = try_tier_leg_batch_bytes_of(256, 256, 1, (2, 3), both).expect("tier bytes");
-        let leg = batch.leg.expect("a tier leg descriptor");
+        let mixed = try_tier_leg_batch_bytes_of(256, 256, 1, (2, 3), both).expect("tier bytes");
         let rule = routed_rule(Program::Qwen35Body);
-        for (downs, first) in [
-            ([Q5_K, Q8_0], DownAct::Q8Act),
-            ([Q8_0, Q5_K], DownAct::Q8Blocks32),
+        for (downs, first, batch) in [
+            ([Q5_K, Q8_0], DownAct::Q8Act, mixed),
+            ([Q8_0, Q5_K], DownAct::Q8Blocks32, mixed),
+            (
+                [Q5_K; 2],
+                DownAct::Q8Act,
+                workstation::tier_leg_batch_bytes(256, 256, 1, 2, 3),
+            ),
         ] {
+            let scratch = |forms| crate::kernels::leg_bytes(2, 1, 256, 256, forms);
+            let selected =
+                DownForms::of(first).with(crate::kernels::down(downs[1]).expect("second down").1);
             let mut model = legged(&[[Q5_K, Q5_K, downs[0]], [Q5_K, Q5_K, downs[1]]]);
             model.experts = 1;
             model.experts_used = 1;
@@ -6480,15 +6487,13 @@ mod tests {
                     .map(|t| t.file_bytes / model.experts)
                     .sum::<u64>()
             };
-            let one =
-                batch.staging + leg.bytes(DownForms::of(first)).expect("first scratch") + expert(0);
-            let two =
-                batch.staging + leg.bytes(both).expect("mixed scratch") + expert(0) + expert(1);
+            let one = batch.staging + scratch(DownForms::of(first)) + expert(0);
+            let two = batch.staging + scratch(selected) + expert(0) + expert(1);
             for (room, counts, forms) in [
                 (one - 1, [0, 0], DownForms::NONE),
                 (one, [1, 0], DownForms::of(first)),
                 (two - 1, [1, 0], DownForms::of(first)),
-                (two, [1, 1], both),
+                (two, [1, 1], selected),
             ] {
                 let mut tier = bytes_card("tier", room, 0..0);
                 tier.reserves
@@ -6506,7 +6511,7 @@ mod tests {
                     .expect("the joint plan");
                 assert_eq!(plan.n_l, [0, 0]);
                 assert_eq!(plan.tier_n_l[0], counts, "{downs:?}, {room}");
-                let selected = batch.staging + leg.bytes(forms).expect("selected scratch");
+                let selected = batch.staging + scratch(forms);
                 assert_eq!(
                     plan.card_reserve(1, TIER_BATCH_RESERVE)
                         .expect("selected reserve"),

@@ -2,8 +2,8 @@
 
 Design snapshot: **`e53cabebbb9b16249c81b7c26a026da1670f7d9d`**, requested by
 [#632](https://github.com/midagedev/bloomery/issues/632). The source-gap observations below describe
-that snapshot. The current tree additionally has a **header-only reader**; it still has no Flint
-body, app session or serve seat. No GPU, inference, performance or weight-content validation is claimed.
+that snapshot. This component tree has a header-only reader and selected common-leg work,
+not a Flint body, app session or serve seat. Primitive evidence below is not model admission.
 
 ## Host reader status
 
@@ -94,6 +94,24 @@ against a different constructor.
 Host-only projections intentionally have no card totals: fixed reserves remain owned by their machine.
 Only a dynamic tier-leg descriptor requires the plan's selected card totals. The existing node paging
 budget regression exercises this distinction without a GPU, including OS reserve and constrained host room.
+
+Follow-up review found a real empty-tier mismatch: the Q8Act-only common constructor still
+advertised fixed scratch while `LegTier` selected no down form for zero resident experts.
+The expanded public planner regression failed before the fix: reserve24868 versus the
+selected allocation20692. `tier_leg_batch_bytes` now produces the same candidate-selected
+descriptor as the explicit-form constructor, preserving its infallible signature.
+Qwen3/Qwen35, MiMo and Muse therefore price their actual selected union, including empty;
+MiniMax, GLM5Next and Solar already use selected constructors. Separate tile/route-based
+fixed-reserve paths remain unchanged. No reserve check is weakened and no unused Q8Act
+buffer is allocated to hide the mismatch. The same regression passes after the repair.
+An old MiMo helper-equality assertion was removed; its actual plan/reserve/refusal checks remain.
+The real mixed-wrapper hardware case also checks allocation of a configured empty tier.
+
+Historical exact-source proof at `3071a9f0d8ed4773692e0c040dece222b90f6bec`:
+GPU library418 passed plus10 held passed, verbs1 passed, and all1657 canonical entries
+identical to main15778e2c (4bins/8carriers, non-JIT rows equal).
+The newly repaired constructor and extended hardware case require their own source-specific
+execution; the PR was returned to Draft on the finding rather than relabel the earlier pass.
 
 A host-only public planner consumer exercised the one-byte boundaries before the first resident layer
 and before adding the other down form, plus descriptor overflow refusal. This proves planning behavior,

@@ -553,7 +553,10 @@ pub const fn tier_batch_bytes(n_embd: u64, ff: u64, n_used: u64, cols: u64) -> T
     }
 }
 
-/// [`tier_batch_bytes`] for a fixed common-leg reserve in the 128-value form.
+/// [`tier_batch_bytes`] for a candidate-selected common leg in the 128-value form.
+///
+/// # Panics
+/// Panics on invalid geometry or overflowing byte counts.
 #[must_use]
 pub fn tier_leg_batch_bytes(
     n_embd: u64,
@@ -562,12 +565,13 @@ pub fn tier_leg_batch_bytes(
     chunk: u64,
     cols: u64,
 ) -> TierBatchBytes {
-    TierBatchBytes {
-        staging: tier_batch_staging_bytes(n_embd, n_used, cols),
-        scratch: tier_chunk_scratch_bytes(n_embd, ff, n_used, chunk),
-        host: tier_batch_host_bytes(n_embd, n_used, cols),
-        leg: None,
-    }
+    tier_leg_batch_bytes_of(
+        n_embd,
+        ff,
+        n_used,
+        (chunk, cols),
+        DownForms::of(DownAct::Q8Act),
+    )
 }
 
 /// The common leg's buffers in `downs`, with the same checked geometry and
