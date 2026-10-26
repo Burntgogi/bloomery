@@ -150,6 +150,19 @@ slot. Its checked byte formula includes `4 * chunk * n_used` when enabled,
 including an empty selected-down union; legacy descriptors leave it disabled.
 The same descriptor prices the loader's scale allocation without reserve padding.
 
+Follow-up review found a real empty-tier mismatch in the Q8Act-only common constructor.
+Its public planner regression failed before the fix: reserve24868 versus selected allocation20692.
+The constructor-level selected-descriptor cutover fixes the accounting source, without weakening
+reserve checks or allocating an unused Q8Act buffer. The same regression passes after repair.
+An old MiMo helper-equality assertion was removed; actual plan/reserve/refusal checks remain.
+The real mixed-wrapper hardware case also checks allocation of a configured empty tier.
+
+Historical component proof at `3071a9f0d8ed4773692e0c040dece222b90f6bec`:
+GPU library418 passed plus10 held passed, verbs1 passed, and all1657 canonical entries
+identical to main15778e2c (4bins/8carriers, non-JIT rows equal).
+The repaired constructor and extended hardware case require their own source-specific
+execution; #783 was returned to Draft rather than relabel the earlier pass.
+
 A host-only public planner consumer exercised the one-byte boundaries before the first resident layer
 and before adding the other down form, plus descriptor overflow refusal. This proves planning behavior,
 not device allocation or expert arithmetic. The existing CUDA leg, batch and tier gates still need an

@@ -1233,6 +1233,29 @@ mod tests {
             }
             assert!(gpu.take_fault().expect("the fault word").is_none());
         }
+        let set = TierSet::new(0..1, EXPERTS, vec![Vec::new()]).expect("an empty tier");
+        let shape = FAMILY.shape(N, FF, 2);
+        let idle = LegTier::new(
+            &gpu,
+            &layers(1),
+            &set,
+            &Weights::default(),
+            shape,
+            FAMILY.program,
+            tier_act,
+        )
+        .expect("a configured tier need not hold an expert");
+        assert_eq!(
+            idle.block_bytes(),
+            kernels::leg_bytes(
+                shape.cap as u64,
+                USED as u64,
+                N as u64,
+                FF as u64,
+                DownForms::NONE,
+            ) as usize,
+            "an empty tier has no down-activation allocation",
+        );
         let triple = [IQ3_S, Q5_K, Q8_0];
         let program = Program::Qwen35Body;
         let w = weights(&gpu, &[triple]);
