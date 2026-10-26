@@ -2,9 +2,9 @@
 
 Design snapshot: **`e53cabebbb9b16249c81b7c26a026da1670f7d9d`**, requested by
 [#632](https://github.com/midagedev/bloomery/issues/632). The source-gap observations below describe
-that snapshot. The integration based on **`e0c82e1779a8e754c53f4442800e6c3d61271a48`**
-adds an actual `gpu-flint` body, application session and shared HTTP seat, not just architecture
-admission. Device execution, GPU numerical acceptance and performance remain unverified.
+that snapshot. The integration adds an actual `gpu-flint` body, application session and shared
+HTTP seat, not just architecture admission. Sections 10–11 retain source-specific historical
+execution evidence; section 12 records the current existing-PR cutover and remaining acceptance.
 
 ## Host reader status
 
@@ -140,9 +140,11 @@ budget regression exercises this distinction without a GPU, including OS reserve
 
 The current-main cutover keeps reserve-only draft holders, per-card budgets and each
 family's activation contract. `LegTier` receives its activation converter at load;
-selected `Program` arms replace the redundant family arm hook. Qwen, Muse, MiMo and
-MiniMax sizing callers propagate checked tier descriptors rather than bypassing
-their validation. Share-budget floors use the same selected reserve calculation.
+selected `Program` arms replace the redundant family arm hook. Common-leg constructors,
+including the infallible Q8Act constructor used by Qwen3/Qwen35, MiMo and Muse, provide
+candidate-selected descriptors. Existing metadata API signatures remain infallible where
+appropriate; separate tile/route-based fixed-reserve paths are unchanged.
+Share-budget floors use the same selected reserve calculation.
 `TierLegScratch::input_scales` names an optional physical f32 scale per chunk
 slot. Its checked byte formula includes `4 * chunk * n_used` when enabled,
 including an empty selected-down union; legacy descriptors leave it disabled.
@@ -669,10 +671,10 @@ residency/NVMe, streamed HTTP and spontaneous tool selection are not established
 
 The first linear integration candidate, `4dadee0195fb652608be59ffecc033a4643ad1eb`,
 starts at main `43073091be21e48cda40d79fe6dae1dfcfd643d5`. The follow-up replay
-starts at main `af74ea46b7f3e47692c2afae09eb64fdddf71461`; neither replay replaces
-the published #799 head. Fixed-source numerical comparisons keep the original production
-and first-candidate images separate from the later replay, and receipts name each image.
-Section 10 remains historical evidence, not acceptance of either integration candidate.
+starts at main `af74ea46b7f3e47692c2afae09eb64fdddf71461`. At that stage neither replay
+replaced the published #799 head; section 12 describes the later history-preserving cutover.
+Fixed-source comparisons keep the original production and candidate images separate, and
+receipts name each image. Section 10 is not acceptance of either replay or the later cutover.
 The placement integration keeps both the cached upload `Footprint` and candidate-selected
 tier scratch/reserves. No compiler pin, numerical band or model admission was widened.
 
@@ -808,6 +810,63 @@ Require fresh NVIDIA evidence tied to each candidate's actual source, model, pla
 and executed hardware case; compiled/ignored tests are not such evidence. Preserve
 existing workloads unless their owner authorizes a separate window. Physical cc12.1
 resource values must be measured, never inferred from an sm_86 build or cc8.6 run.
+
+## 12. Existing-PR cutover and same-input head probe — 2026-10-26
+
+The existing #799 branch now integrates fixed main
+`15778e2cb2dd7af428d2dd14259e6b0ea8ca6b89` by ordinary merges, preserving both its
+original `ebce5badb6f375c74930ff26a4eb50e7e74ce97d` ancestry and the previous D6 replay.
+It also preserves the component histories of #781, #782 and #783. This is not a replacement
+PR or a force-push. The cutover adopts main's Rust1.99.1 and pinned cuda-oxide9df9e7ce /
+repository backend patch31ab6a1d3f58, not a contribution-specific compiler override.
+The older nightly/87bc runtime arrays remain evidence of their own source/toolchain only.
+
+Current-main's prequantized leg input and metadata-only `Common` remain separate.
+Both ordinary and prequantized entry points retain the loaded `AmaxF16` protection state.
+The already-activated card leg normalizes with `rule=None`: its second device ABI operand
+is unread, so it borrows the distinct existing down buffer rather than allocating or copying
+a fake input. A hardware regression compares ordinary input with prequantized captured replay,
+including changed amplitudes, Direct/AmaxF16, full/partial batches and skipped/tail canaries.
+Compilation is not evidence that this new hardware case has executed.
+
+The cutover's production/test source `cb77a4788116c00a02122a56f47efff97c3ba47f`
+passed native all-target Clippy and formatting, with three warning lines against ratchet three.
+Its host library run passed chain23, GGUF67, placement206 and model563 (five model tests
+ignored); zero tests were filtered by the historical known-base-test skip.
+Common-name and unsafe ownership checks also passed after the contract reconciliation.
+These checks are distinct from current-head NVIDIA/model acceptance.
+
+### Measured head/upstream separation, not a precision fix
+
+A throwaway probe used the preserved mainline CPU backend
+`a37cc46104eb50900d5ab4a9ba02a0abdac039db`, four threads, and the original complete
+Q8_0 output matrix (2048 × 150144). It evaluated both CPU and GPU final-normalization
+vectors from the matched-boundary v2 trajectory. Its CPU-input controls reproduce the
+original complete 150144-logit rows bit for bit at both calls; this validates the cross-input
+comparison rather than a dequantized/reduced-matrix approximation.
+
+Here `HC`/`HG` are the CPU/GPU head implementations and `xC`/`xG` their saved norm inputs.
+Each cell is the first named token's logit minus the second's:
+
+| Predicted position / token pair | HC(xC) | HC(xG) | HG(xG) | HG(xG) − HC(xG) | HC(xG) − HC(xC) |
+|---|---:|---:|---:|---:|---:|
+| 38 / 86671 − 55591 | +0.164879680 | −0.166242123 | −0.142640829 | +0.023601294 | −0.331121802 |
+| 96 / 26007 − 29263 | +0.238318443 | +0.005065918 | −0.018128157 | −0.023194075 | −0.233252525 |
+
+At position96, the CPU head on the GPU norm selects26007, whereas the actual GPU head
+selects29263. At position38 the CPU head on the GPU norm still selects55591. A head-only
+change therefore cannot resolve the whole trajectory. The columns separate head-implementation
+and upstream contributions; they do not identify the first upstream operation or attribute all
+head difference to one quantization step. No production precision, tolerance, tie rule or oracle
+criterion was changed, and no existing GPU arm was replayed for this CPU-only probe.
+
+Raw inputs, complete output rows, bit-identity controls, exact margins and reproduction source
+are retained under the contribution workspace's `flint-closure-20261026/head-probe/`.
+Original v2 GPU arrays remain at their earlier remote locations; they were not overwritten
+or reattributed to this cutover. Keep #799 Draft pending exact-source runtime acceptance,
+the Korean numerical/oracle decision, genuine physical cc12.1 resource measurements and
+remaining affected common/residency/tier/NVMe coverage. Component review readiness is not
+whole-model admission, merge, issue closure, ROCm support or a performance result.
 
 
 [needs]: https://github.com/midagedev/bloomery/blob/e53cabebbb9b16249c81b7c26a026da1670f7d9d/crates/models/src/need.rs#L505-L531
