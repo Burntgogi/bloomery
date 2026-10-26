@@ -46,7 +46,7 @@ use model::placement::accepts::{self, LegArms, Program};
 use model::placement::kernels::{self, DownAct, DownForms};
 
 use crate::card_leg::{
-    self, CardLeg, LegBufs, LegRun, LegShape, LegStacks, LegSum, RouteBlock, RouteW,
+    self, CardLeg, LegBufs, LegRun, LegShape, LegStacks, LegSum, RouteBlock, RouteW, STACK_ROLES,
 };
 use crate::card_slots::{CardSlotKernels, Places};
 use crate::gemm::Gemm32Kernels;
@@ -56,12 +56,6 @@ use crate::kquant::Act;
 use crate::ring_gemm::RingGemm;
 use crate::weights::Weights;
 use crate::{DeviceTensor, Gpu, GpuError};
-
-/// The selected program, rather than a union of unrelated launches, admits stacks.
-const STACK_ROLES: (&str, &str) = (
-    "a resident routed gate or up stack the selected card gate·up arm runs",
-    "a resident routed down stack the selected card down arm runs",
-);
 
 /// What a family fixes of its card experts.
 #[derive(Clone, Copy)]

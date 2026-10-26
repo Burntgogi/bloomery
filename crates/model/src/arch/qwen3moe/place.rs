@@ -45,8 +45,7 @@ pub const TIER_CHUNK: u64 = 8;
 /// The expert tier's prompt-batch bytes ([`TierBatchBytes`]) for blocks of
 /// the host union's columns ([`crate::moe::UNION_MAX_COLS`]): the tier card's
 /// staging, one chunk of the card leg's scratch and the host's rows.
-#[must_use]
-pub fn tier_batch(hp: &Hparams) -> TierBatchBytes {
+pub fn tier_batch(hp: &Hparams) -> Result<TierBatchBytes, PlacementError> {
     workstation::tier_leg_batch_bytes(
         hp.n_embd as u64,
         hp.experts.ff as u64,

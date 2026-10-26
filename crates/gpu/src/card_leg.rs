@@ -514,14 +514,12 @@ struct LegStack<'a> {
 }
 
 impl<'a> LegStack<'a> {
-    /// The resident stack `name`: a `KQuant` stack of a type `runs` admits in
-    /// the stack's role, or an NVFP4 stack in its planes where `planes`
-    /// admits NVFP4; `role` is the refusal's words.
+    /// The resident stack `name` of a type `runs` admits in its role,
+    /// including plane-backed NVFP4 when admitted; `role` names a refusal.
     fn of(
         w: &'a Weights,
         name: &'a str,
         runs: fn(GgmlType) -> bool,
-        planes: fn(GgmlType) -> bool,
         role: &'static str,
     ) -> Result<LegStack<'a>, GpuError> {
         match w.get(name) {
@@ -537,7 +535,7 @@ impl<'a> LegStack<'a> {
                 w: StackW::Q5_0(w),
                 k: *k,
             }),
-            Some(DevWeight::Nvfp4Stack { k, .. }) if planes(GgmlType::NVFP4) => Ok(LegStack {
+            Some(DevWeight::Nvfp4Stack { k, .. }) if runs(GgmlType::NVFP4) => Ok(LegStack {
                 name,
                 ty: GgmlType::NVFP4,
                 w: StackW::Nvfp4(w.nvfp4_stack(WHAT, name)?),
@@ -609,6 +607,12 @@ impl<'a> LegStack<'a> {
 const GATE_UP: &str =
     "a resident routed gate or up stack of a type the card leg runs (`kernels::card_gate_up_runs`)";
 
+/// The selected program admits the same resident stack roles on card and tier.
+pub(crate) const STACK_ROLES: (&str, &str) = (
+    "a resident routed gate or up stack the selected program's gate·up arm runs",
+    "a resident routed down stack the selected program's down arm runs",
+);
+
 /// A layer's three resident routed stacks, the gate and up of one type.
 #[derive(Clone, Copy)]
 pub struct LegStacks<'a> {
@@ -670,9 +674,9 @@ impl<'a> LegStacks<'a> {
     ) -> Result<LegStacks<'a>, GpuError> {
         let [gate, up, down] = names;
         let (gate, up, down) = (
-            LegStack::of(w, gate, arms.gate_up, arms.gate_up, roles.0)?,
-            LegStack::of(w, up, arms.gate_up, arms.gate_up, roles.0)?,
-            LegStack::of(w, down, arms.down, arms.down, roles.1)?,
+            LegStack::of(w, gate, arms.gate_up, roles.0)?,
+            LegStack::of(w, up, arms.gate_up, roles.0)?,
+            LegStack::of(w, down, arms.down, roles.1)?,
         );
         if up.ty != gate.ty {
             return Err(GpuError::Tensor {
@@ -1492,8 +1496,8 @@ impl<'a> Relu2Stacks<'a> {
         const DOWN: &str = "a resident routed down stack of a 32-value-block type the card leg runs (`kernels::card_sel32_runs`)";
         let [up, down] = names;
         Ok(Relu2Stacks {
-            up: LegStack::of(w, up, kernels::card_sel32_runs, |_| false, UP)?,
-            down: LegStack::of(w, down, kernels::card_sel32_runs, |_| false, DOWN)?,
+            up: LegStack::of(w, up, kernels::card_sel32_runs, UP)?,
+            down: LegStack::of(w, down, kernels::card_sel32_runs, DOWN)?,
         })
     }
 

@@ -176,7 +176,7 @@ mod tests {
 
     use super::super::hparams::tests::{LAYERS, keys, tensors};
     use super::{PROMPT_ROWS, PlaceError, PlanInputs, prompt_reserve_bytes, tier_batch};
-    use crate::arch::synthetic::{V, header_shaped};
+    use crate::arch::synthetic::{Ty, V, header_shaped, header_typed};
     use crate::placement::{Device, PlacementError, PlanLevers, Violation, workstation};
 
     /// The small header's file, described; each test names its own file (the tests run in
@@ -319,9 +319,6 @@ mod tests {
     /// at the allocation).
     #[test]
     fn a_host_only_mixture_keeps_the_exact_prompt_reserve_boundary() {
-        use crate::placement::{ExpertPart, Role};
-        use gguf::GgmlType::{Q5_K, Q8_0};
-
         let mut kv = keys();
         for (key, value) in &mut kv {
             if matches!(*key, "embedding_length" | "expert_feed_forward_length") {
@@ -367,47 +364,28 @@ mod tests {
             ("tokenizer.ggml.pre", V::Str("solar-open")),
             ("tokenizer.chat_template", V::Str("{{ messages }}")),
         ];
-        let path = header_shaped("so2-place-mixed-reserve", "solar-open2", &kv, &global, &ts);
-        let split = Split::open(&path).expect("the mixed fixture opens");
-        let mut inputs = PlanInputs::describe(&split).expect("valid routed geometry");
-        std::fs::remove_file(path).expect("remove the header fixture");
-        for t in inputs
-            .model
-            .tensors
-            .iter_mut()
-            .filter(|t| t.role == Role::RoutedExperts)
-        {
-            t.ty = Q5_K;
-            t.file_bytes = t.dims.iter().product::<u64>() / t.ty.blck_size().unwrap()
-                * t.ty.type_size().unwrap();
-        }
-        let admitted = prompt_reserve_bytes(&inputs.hp, &inputs.spec, &inputs.model, PROMPT_ROWS)
-            .expect("the admitted prompt reserve");
-        let admitted_tier = tier_batch(&inputs).expect("the admitted tier reserve");
-        let down = inputs
-            .model
-            .tensors
-            .iter_mut()
-            .find(|t| {
-                t.role == Role::RoutedExperts
-                    && t.layer == Some(0)
-                    && ExpertPart::of_name(&t.name) == Some(ExpertPart::Down)
+        let ts: Vec<_> = ts
+            .into_iter()
+            .map(|(name, dims)| {
+                let ty = if name == "blk.0.ffn_down_exps.weight" {
+                    Ty::Q8_0
+                } else if matches!(
+                    name.rsplit('.').nth(1),
+                    Some("ffn_gate_exps" | "ffn_up_exps" | "ffn_down_exps")
+                ) {
+                    Ty::Q4K
+                } else {
+                    Ty::F32
+                };
+                (name, dims, ty)
             })
-            .expect("layer zero's down");
-        down.ty = Q8_0;
-        down.file_bytes = down.dims.iter().product::<u64>() / down.ty.blck_size().unwrap()
-            * down.ty.type_size().unwrap();
+            .collect();
+        let path = header_typed("so2-place-mixed-reserve", "solar-open2", &kv, &global, &ts);
+        let split = Split::open(&path).expect("the mixed fixture opens");
+        let inputs = PlanInputs::describe(&split).expect("valid routed geometry");
+        std::fs::remove_file(path).expect("remove the header fixture");
         let reserve = prompt_reserve_bytes(&inputs.hp, &inputs.spec, &inputs.model, PROMPT_ROWS)
             .expect("prompt reserve");
-        assert_eq!(
-            reserve, admitted,
-            "the host-only Q8_0 down adds no card form"
-        );
-        assert_eq!(
-            tier_batch(&inputs).expect("mixed tier reserve"),
-            admitted_tier
-        );
-        inputs.prompt_reserve = reserve;
         let ample = workstation::plan_gate(LAYERS);
         let placed = inputs
             .plan(&ample, 64, &PlanLevers::default())
@@ -457,5 +435,9 @@ mod tests {
             .plan(&machine, 64, &levers)
             .expect("the card holds the terms and the reserve");
         assert!(plan.violations().is_empty());
+        assert!(
+            plan.n_l.iter().all(|&n| n == 0),
+            "the exact dense-and-prompt budget leaves no expert room"
+        );
     }
 }

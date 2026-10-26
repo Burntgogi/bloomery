@@ -95,16 +95,25 @@ Host-only projections intentionally have no card totals: fixed reserves remain o
 Only a dynamic tier-leg descriptor requires the plan's selected card totals. The existing node paging
 budget regression exercises this distinction without a GPU, including OS reserve and constrained host room.
 
-Follow-up review found a real empty-tier mismatch: the Q8Act-only common constructor still
-advertised fixed scratch while `LegTier` selected no down form for zero resident experts.
-The expanded public planner regression failed before the fix: reserve24868 versus the
-selected allocation20692. `tier_leg_batch_bytes` now produces the same candidate-selected
-descriptor as the explicit-form constructor, preserving its infallible signature.
-Qwen3/Qwen35, MiMo and Muse therefore price their actual selected union, including empty;
-MiniMax, GLM5Next and Solar already use selected constructors. Separate tile/route-based
-fixed-reserve paths remain unchanged. No reserve check is weakened and no unused Q8Act
-buffer is allocated to hide the mismatch. The same regression passes after the repair.
-An old MiMo helper-equality assertion was removed; its actual plan/reserve/refusal checks remain.
+`tier_leg_batch_bytes` and the explicit-form `try_tier_leg_batch_bytes_of` return
+`Result<TierBatchBytes, PlacementError>` and construct candidate-selected descriptors.
+An empty tier selects no down form, matching `LegTier`'s actual allocation instead of
+advertising unused Q8Act scratch. Qwen3/Qwen35, MiMo and Muse use this checked path.
+MiniMax obtains its forms from `accepts::leg_down_forms` under its selected program,
+as GLM5Next and Solar do; no fallback format can admit a mismatched triple.
+The checked constructors and non-leg paths share staging and host byte formulas.
+Malformed geometry and overflow are refused rather than panicking; a dense Qwen3.6
+request for an expert tier is a named metadata refusal, not zero expert geometry.
+Separate tile/route-based fixed-reserve paths remain unchanged.
+
+The planner's selected scratch calculation has one union/byte rule. Fill prepares
+per-layer forms once for dynamic tier-leg cards, including multiple forms in one
+layer, and reuses them with its cached footprint instead of rescanning tensors for
+each candidate. Fixed-reserve cards need no selected-form cache.
+
+The Solar budget regression starts from a typed mixed GGUF description and exercises
+the planner's one-byte refusal/success boundary without overwriting its described
+prompt reserve. The exact dense-and-prompt budget leaves no room for expert weights.
 The real mixed-wrapper hardware case also checks allocation of a configured empty tier.
 
 Historical exact-source proof at `3071a9f0d8ed4773692e0c040dece222b90f6bec`:
@@ -115,9 +124,6 @@ real CUDA mixed/empty-tier consumer:1 passed,0 failed,0 ignored,427 filtered,24.
 Its fresh4bin/8carrier canonical comparison again found all1657entries identical to main15778e2c,
 with non-JIT rows equal. Native formatting/Clippy passed (warning3=ratchet3); model557 and
 placement202 passed,0 failed,5 model tests ignored,0 filtered.
-Request75d4e06e-f3fb-4001-bcc4-e188c169edf5 exited0, credential cleanup unconfirmed;
-GPU1 remained active/healthy and was not stopped. The PR returned to review-ready only after
-this repair proof. Later documentation-only commits do not count as another hardware run.
 
 The host-only public planner consumer covers one-byte boundaries before the first resident layer
 and before adding another down form, plus descriptor overflow refusal. These and the CUDA consumer

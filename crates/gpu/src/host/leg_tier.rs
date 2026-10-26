@@ -40,7 +40,7 @@ use super::run::{HostRun, HostWidths};
 use super::tier::{
     TierAct, TierBlock, TierCard, TierExperts, TierInput, TierIo, TierOpen, TierSet, TierShape,
 };
-use crate::card_leg::{CardLeg, LegBufs, LegRun, LegShape, LegStacks};
+use crate::card_leg::{CardLeg, LegBufs, LegRun, LegShape, LegStacks, STACK_ROLES};
 use crate::hybrid::{Hybrid, SlotMap};
 use crate::kquant::Act;
 use crate::model::CardBytes;
@@ -52,12 +52,6 @@ const WHAT: &str = "LegTier";
 
 /// What the stage card's side of the tier layers names in its errors.
 const SIDE: &str = "TierSide";
-
-/// The selected program's launches admit the same stacks on both cards.
-const STACK_ROLES: (&str, &str) = (
-    "a resident routed gate or up stack the selected tier gate·up arm runs",
-    "a resident routed down stack the selected tier down arm runs",
-);
 
 /// The tier the stage card's tier entries serve: they hand one tier its
 /// image and join one tier's rows, so a load holds one tier card

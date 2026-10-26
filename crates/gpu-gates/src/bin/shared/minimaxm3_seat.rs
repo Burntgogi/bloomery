@@ -180,7 +180,7 @@ fn load(file: &Path, ctx: usize, route_trace: bool, arm: Arm) -> Result<Loaded, 
     };
     let machine = arm.machine(
         inputs.model.layers,
-        bloomery_gpu_minimaxm3::tier::tier_batch(&inputs),
+        bloomery_gpu_minimaxm3::tier::tier_batch(&inputs)?,
     )?;
     let place = PlanLevers::from_levers(&levers)?;
     let plan = inputs.plan(&machine, u64::try_from(ctx)?, &place)?;
@@ -265,7 +265,7 @@ pub fn two_card(
     let inputs = described(minimaxm3_folder::model_at(file)?.header())?;
     let layers = inputs.model.layers;
     let walk = walk(steps, inputs.hp.n_vocab);
-    let two = Arm::Bp.machine(layers, bloomery_gpu_minimaxm3::tier::tier_batch(&inputs))?;
+    let two = Arm::Bp.machine(layers, bloomery_gpu_minimaxm3::tier::tier_batch(&inputs)?)?;
     let flat = Machine {
         tiers: Vec::new(),
         ..two.clone()
