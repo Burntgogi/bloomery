@@ -52,7 +52,7 @@ use super::hparams::Kind;
 use super::{mtp, names};
 use crate::arch::{architecture_is, coverage};
 use crate::placement::accepts::{
-    Program, leg_card_format, program_of, qwen38_down, qwen38_gate_up, routed_rule,
+    Program, leg_card_format, leg_down_forms, program_of, qwen38_down, qwen38_gate_up, routed_rule,
 };
 use crate::placement::ctx::{CtxLimit, PastLimit, check_slot_ctx};
 use crate::placement::ctx_ask::PlanRefusal;
@@ -1498,18 +1498,19 @@ pub const LEG_TIER_CHUNK: u64 = 8;
 /// card's staging, one chunk of the leg's scratch and the host's rows, for
 /// blocks of the host union's columns. [`tier_batch`] is the qwen4exp plan's
 /// figure.
-pub fn leg_tier_batch(spec: &ModelSpec) -> Result<TierBatchBytes, PlacementError> {
+pub fn leg_tier_batch(inputs: &PlanInputs) -> Result<TierBatchBytes, PlacementError> {
+    let spec = &inputs.spec;
     let moe = spec.routed().ok_or_else(|| PlacementError::Metadata {
         key: "Qwen3.6 expert tier".into(),
         detail: "a dense model has no routed experts for an expert tier".into(),
     })?;
     let (expert_ff, n_used) = (u64::from(moe.expert_ff), u64::from(moe.top_k));
-    workstation::tier_leg_batch_bytes(
+    workstation::try_tier_leg_batch_bytes_of(
         u64::from(spec.hidden),
         expert_ff,
         n_used,
-        LEG_TIER_CHUNK,
-        crate::moe::UNION_MAX_COLS as u64,
+        (LEG_TIER_CHUNK, crate::moe::UNION_MAX_COLS as u64),
+        leg_down_forms(Program::Qwen35Body, &inputs.model),
     )
 }
 
