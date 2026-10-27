@@ -7,6 +7,9 @@
 //! the out projection, a GEMM adding into the residual; the FFN norm, the
 //! router's GEMM, the selection and the route table; the grouped experts and
 //! the combine. Each op closes its group with a barrier, as the step's do.
+//! A layer's slots are the routed picks and, when the instance's router has a
+//! shared row, the shared expert's: its gate GEMM, id, group and tensors are
+//! there only then.
 //!
 //! The pass's operand is [`PASS_OPERAND`], one place for every GEMM of the
 //! pass but the router's, which is f32. The pass's step record slot, where
@@ -17,7 +20,7 @@ use bloomery_device::fault::LAYER_HEAD;
 use bloomery_device::{Buffer, Elems};
 use chain::ChainError;
 
-use super::super::arena::{Arena, FfnBufs, MixerBufs, SharedBufs, lane_of, layer_word, slot_of};
+use super::super::arena::{Arena, MixerBufs, lane_of, layer_word, slot_of};
 use super::super::session::SessionError;
 use super::{MetalOps, WHAT, all, all_mut};
 use crate::kernels::{
@@ -207,6 +210,7 @@ impl MetalOps<'_, '_> {
             layers,
             faults,
             hidden,
+            geom,
             ..
         } = &mut *self.arena;
         let MixerBufs::Attention(a) = &layers[l].mixer else {
@@ -216,12 +220,16 @@ impl MetalOps<'_, '_> {
             )
             .into());
         };
+        let out_cols = geom
+            .attn
+            .out_len()
+            .ok_or_else(|| ChainError::shape(WHAT, "the attention output does not fit"))?;
         self.kernels.gemm(
             self.enc,
             GemmParams {
                 quant: a.out_quant,
                 rows: *hidden,
-                cols: rows.mix_stride,
+                cols: out_cols,
                 acts: m,
                 weights: all(&a.out)?,
                 x: rows.mix.window(Elems(0), Elems(m * rows.mix_stride))?,
@@ -407,8 +415,8 @@ impl MetalOps<'_, '_> {
     }
 
     /// Layer `l`'s router over the rows: the FFN norm, the router's logits
-    /// (the routed rows, then the shared expert's gate), every row's picks
-    /// and the route table.
+    /// (the routed rows, then the shared expert's gate when the layer has
+    /// one), every row's picks and the route table.
     pub(super) fn rows_route(&mut self, l: usize, m: usize) -> Result<(), SessionError> {
         let slot = self.pass_slot(m);
         let Some(ctx) = self.rows.as_mut() else {
@@ -462,23 +470,25 @@ impl MetalOps<'_, '_> {
                 layer: layer_word(l),
             },
         )?;
-        self.kernels.gemm_f32(
-            self.enc,
-            F32GemmParams {
-                rows: 1,
-                cols: *hidden,
-                acts: m,
-                weights: all(&shared_of(f, l)?.gate_inp)?,
-                x: rows.xn.window(Elems(0), Elems(m * *hidden))?,
-                x_stride: *hidden,
-                y: rows
-                    .logits
-                    .window_mut(Elems(*n_experts), Elems(routed_cols + 1))?,
-                y_stride: logit_stride,
-                fault: &faults[slot],
-                layer: layer_word(l),
-            },
-        )?;
+        if let Some(shared) = &f.shared {
+            self.kernels.gemm_f32(
+                self.enc,
+                F32GemmParams {
+                    rows: 1,
+                    cols: *hidden,
+                    acts: m,
+                    weights: all(&shared.gate_inp)?,
+                    x: rows.xn.window(Elems(0), Elems(m * *hidden))?,
+                    x_stride: *hidden,
+                    y: rows
+                        .logits
+                        .window_mut(Elems(*n_experts), Elems(routed_cols + 1))?,
+                    y_stride: logit_stride,
+                    fault: &faults[slot],
+                    layer: layer_word(l),
+                },
+            )?;
+        }
         self.enc.memory_barrier();
         self.kernels.route_rows_select(
             self.enc,
@@ -505,7 +515,7 @@ impl MetalOps<'_, '_> {
                 inv: rows.inv.window_mut(Elems(0), Elems(slots))?,
                 tiles: rows
                     .tiles
-                    .window_mut(Elems(0), Elems(route_table_words(slots, *n_experts)))?,
+                    .window_mut(Elems(0), Elems(route_table_words(slots, geom.router.rows)))?,
                 fault: &faults[slot],
                 layer: layer_word(l),
             },
@@ -532,8 +542,8 @@ impl MetalOps<'_, '_> {
         } = &mut *self.arena;
         let f = &layers[l].ffn;
         let (slots, expert_k) = (m * geom.experts.slots, geom.experts.k);
-        let max_tiles = route_tiles(slots, *n_experts);
-        let table_words = route_table_words(slots, *n_experts);
+        let max_tiles = route_tiles(slots, geom.router.rows);
+        let table_words = route_table_words(slots, geom.router.rows);
         self.kernels.gemm_routed(
             self.enc,
             RoutedParams {
@@ -545,8 +555,8 @@ impl MetalOps<'_, '_> {
                 experts: *n_experts,
                 stack: all(&f.gate)?,
                 stack_up: Some(all(&f.up)?),
-                shared: all(&shared_of(f, l)?.gate)?,
-                shared_up: Some(all(&shared_of(f, l)?.up)?),
+                shared: f.shared.as_ref().map(|s| all(&s.gate)).transpose()?,
+                shared_up: f.shared.as_ref().map(|s| all(&s.up)).transpose()?,
                 x: rows.xn.window(Elems(0), Elems(m * *hidden))?,
                 x_rows: m,
                 x_stride: *hidden,
@@ -574,7 +584,7 @@ impl MetalOps<'_, '_> {
                 experts: *n_experts,
                 stack: all(&f.down)?,
                 stack_up: None,
-                shared: all(&shared_of(f, l)?.down)?,
+                shared: f.shared.as_ref().map(|s| all(&s.down)).transpose()?,
                 shared_up: None,
                 x: rows.h.window(Elems(0), Elems(slots * expert_k))?,
                 x_rows: slots,
@@ -653,21 +663,6 @@ impl MetalOps<'_, '_> {
         )?;
         Ok(())
     }
-}
-
-/// Layer `l`'s shared expert, whose rows the rows arm runs with the picks':
-/// a layer whose router runs none takes its prompt a step each
-/// (`PrefillMode::Steps`).
-fn shared_of(f: &FfnBufs, l: usize) -> Result<&SharedBufs, SessionError> {
-    f.shared.as_ref().ok_or_else(|| {
-        ChainError::shape(
-            WHAT,
-            format!(
-                "layer {l}: the rows arm runs a shared expert's rows, and this router has none"
-            ),
-        )
-        .into()
-    })
 }
 
 #[cfg(test)]
