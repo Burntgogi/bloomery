@@ -2024,8 +2024,8 @@ fn swiglu(
 #[cfg(test)]
 mod tests {
     use super::{
-        Form, SiteTy, SwigluLaunch, WideActs, WideForms, by_name_extra, file_site,
-        gemm_weight, kgemv_order, swiglu_launch,
+        Form, SiteTy, SwigluLaunch, WideActs, WideForms, by_name_extra, file_site, gemm_weight,
+        kgemv_order, swiglu_launch,
     };
     use crate::kquant::Act;
     use gguf::Split;
