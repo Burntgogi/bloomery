@@ -130,10 +130,19 @@ case derives a scalar floating-operation bound; uniform codes do not detect nibb
 decode ordering. That remains a separate IQ4 kernel-gate obligation, not a
 whole-model accuracy pin or a claim made by this wrapper fixture.
 
-Existing program-specific admission remains unchanged: in particular the legacy
-Qwen projection/shared dispatch does not gain this site automatically. Flint's implemented
-Program binds the real ordinary dense/shared operations. Run the new consumer gate and affected
-regressions on NVIDIA before claiming device support; header coverage is not arithmetic proof.
+The pinned current-main merge (`cb8d92ebddd1ce1a325a15450c06a01f57ecf88c`) also
+reconciles its existing Qwen3.8 projected-site consumer: `site::PROJECTED` includes
+IQ4_XS, and selected dispatch uses the supplied stream. Projected attention/shared
+sites are admitted; the K=640 shared down and unsupported types/shapes remain refused.
+This reuses the existing program and kernel, not a new model implementation.
+Flint's implemented Program separately binds the real ordinary dense/shared operations.
+
+At component source `b0fc05e5349330927ceb33ce6f30e584f25ecf4d`, the typed GGUF
+`iq4_sites_keep_shape_and_launch_admission_separate` consumer passed1 case,
+0 failed/ignored,430 filtered. Its successful arm uses `PROJECTED`, not merely
+`ALL`; this checks actual file admission rather than copying a metadata registry.
+The case is metadata-only and creates no CUDA context; oxide owns its linking.
+It is neither fresh NVIDIA stream/launch execution nor a run of this integration.
 
 On 2026-10-26, source `203f5125a3c48a5b700c6f43318cfcb9c77ff169` executed the owning
 DS41 library on Hikari GPU0 (RTX3090 cc8.6, driver595.91.07):38 passed,0 failed,0 ignored,
