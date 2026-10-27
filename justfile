@@ -1541,7 +1541,7 @@ gate-gpu-llama-dense:
 # through a scripted engine behind the same template, and answers /completion at temperature 0 with the ids generate_qwen3moe --last-step prints for the
 # same ids (run once the server has stopped, the file does not fit a card twice). One card; the gate lock.
 gate-gpu-llama-serve:
-    BLOOMERY_MODEL=nanbeige43 ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features glm5next,clef,mimo2,solar2,minimaxm3,vision,gemma-embedding2,hf,checkpoint --release --bin bloomery-serve --bin gate_llama_serve && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin generate_qwen3moe && D=target/llama-serve-gate && rm -rf $D && mkdir -p $D && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_llama_serve --dir $D'
+    BLOOMERY_MODEL=nanbeige43 ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features glm5next,clef,mimo2,solar2,minimaxm3,flint,vision,gemma-embedding2,hf,checkpoint --release --bin bloomery-serve --bin gate_llama_serve && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin generate_qwen3moe && D=target/llama-serve-gate && rm -rf $D && mkdir -p $D && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_llama_serve --dir $D'
 
 # Body35's image rows on Clef-Flash at bartowski's Q8_0 (9.5 GB, either card), against the clefvis sets (set B's tower rows
 # as the spans' rows; set C's three prompts, their CPU twins and the C'' runs): the unit rows and the text rows a media call
