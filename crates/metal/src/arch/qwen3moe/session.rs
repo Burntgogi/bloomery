@@ -96,10 +96,10 @@ use crate::buffer::MetalBuffer;
 use crate::checkpoint::{self, Checkpoints, Restore};
 use crate::device::MetalDevice;
 use crate::encode::EncodeCount;
+use crate::geom::Geometry;
 use crate::handle::Handle;
-use crate::kernels::{
-    EXPERT_SLOTS, HEAD_DIM, Kernels, PASS_ROWS, SNAPS, segments_for_keys, state_elems,
-};
+use crate::instance::Instance;
+use crate::kernels::{Kernels, PASS_ROWS, SNAPS, segments_for_keys};
 use crate::library::Library;
 use crate::residency::{Alloc, ResidencyStats};
 use crate::stream::{
@@ -112,7 +112,7 @@ pub(super) const WHAT: &str = "qwen35moe session";
 /// The most rows of one pass, and the spacing of a prompt call's inner
 /// checkpoints ([`runtime::seqstate::marks`]): a mark falls between two
 /// passes, so a pass never holds a position a checkpoint needs. The family's
-/// ubatch rule at nine slots a row over [`MAX_PASS_SLOTS`] slots
+/// ubatch rule at an instance's slots a row over [`max_pass_slots`] slots
 /// ([`pass_rows_max`]).
 ///
 /// A point copies each delta layer's state lane and its conv ring.
@@ -124,14 +124,16 @@ pub(super) const WHAT: &str = "qwen35moe session";
 /// between points re-feeds at most 2047 positions.
 pub const CHECKPOINT_EVERY: u32 = 2048;
 
-/// The slots of one pass the rows arena holds: its experts' buffers are a row
-/// a slot.
-const MAX_PASS_SLOTS: usize = EXPERT_SLOTS * CHECKPOINT_EVERY as usize;
+/// The slots of one pass of `g`'s instance the rows arena holds: its experts'
+/// buffers are a row a slot.
+fn max_pass_slots(g: &Geometry) -> usize {
+    g.experts.slots * CHECKPOINT_EVERY as usize
+}
 
-/// The most rows of one pass, by the family's ubatch rule.
+/// The most rows of one pass of `g`'s instance, by the family's ubatch rule.
 #[must_use]
-pub fn pass_rows_max() -> usize {
-    chain::arch::qwen3moe::router::ubatch_at(EXPERT_SLOTS, MAX_PASS_SLOTS)
+pub fn pass_rows_max(g: &Geometry) -> usize {
+    chain::arch::qwen3moe::router::ubatch_at(g.experts.slots, max_pass_slots(g))
 }
 
 /// The site types Metal's mat-vecs launch: the kernels' quant set
@@ -522,7 +524,11 @@ impl Probe<'_> {
             Node::DeltaG => whole(&a.g),
             Node::DeltaPartials => whole(&a.delta_partials),
             Node::DeltaState(l) => {
-                let lane = state_elems(1).ok_or_else(|| refuse("a state lane does not fit"))?;
+                let lane = a
+                    .geom
+                    .delta
+                    .state_elems(1)
+                    .ok_or_else(|| refuse("a state lane does not fit"))?;
                 let at = self.lane * lane;
                 read(&delta(l)?.state, at..at + lane)
             }
@@ -539,11 +545,12 @@ impl Probe<'_> {
                 if pos >= a.ctx {
                     return Err(refuse(format!("{node:?}: the cache holds {} rows", a.ctx)));
                 }
-                let heads = cache.pages().len().get() / (a.ctx * HEAD_DIM);
-                let mut out = Vec::with_capacity(heads * HEAD_DIM);
+                let head = a.geom.attn.head;
+                let heads = cache.pages().len().get() / (a.ctx * head);
+                let mut out = Vec::with_capacity(heads * head);
                 for h in 0..heads {
-                    let at = (h * a.ctx + pos) * HEAD_DIM;
-                    let bits = read(cache, at..at + HEAD_DIM)?;
+                    let at = (h * a.ctx + pos) * head;
+                    let bits = read(cache, at..at + head)?;
                     out.extend(bits.into_iter().map(gguf::quant::half_to_f32));
                 }
                 Ok(out)
@@ -584,8 +591,9 @@ pub struct Session {
     /// nothing.
     clock: Option<StepClock>,
     /// Each delta layer's state lane and conv ring, at the positions a
-    /// prompt call takes.
-    checkpoints: Checkpoints,
+    /// prompt call takes; none for a file of no recurrent store, whose
+    /// caches hold every position below the one it stands at.
+    checkpoints: Option<Checkpoints>,
     /// The device the mark copies are opened on, by the first pass that
     /// takes one when the open did not make them.
     device: Handle<dyn MTLDevice>,
@@ -665,6 +673,17 @@ pub struct Passed {
 }
 
 impl Session {
+    /// The instance the file at `path` selects by its shape: the library a
+    /// session of it with a cache of `ctx` rows opens on. The open's own
+    /// check decides it, so a shape no instance is built for, and every
+    /// other refusal the open would meet first, is refused by name before
+    /// a device opens.
+    pub fn instance_of(path: &Path, ctx: usize) -> Result<&'static Instance, SessionError> {
+        let split = Split::open(path)
+            .map_err(|e| refuse(format!("{} did not open: {e}", path.display())))?;
+        Ok(check::check(&split, ctx).checked_or_first()?.instance)
+    }
+
     /// The session of the file at `path` on `device`, its pipelines from
     /// `library`, with a cache of `ctx` rows: the plan read from the file's
     /// header, every weight copied into the arena, every store at rest, and
@@ -695,7 +714,8 @@ impl Session {
     /// Every buffer is made and the residency set committed here, once: a
     /// refusal is a named error and leaves the set as it was, and no pass
     /// allocates or builds a pipeline but the first marked pass of a session
-    /// opened [`MarkCopies::OnFirstMark`].
+    /// opened [`MarkCopies::OnFirstMark`]. A file whose shape selects no
+    /// instance, or another than `library`'s, is refused by name.
     pub fn open_as(
         device: &MetalDevice,
         library: &Library,
@@ -715,6 +735,16 @@ impl Session {
         // Every refusal the header and tensor table hold, in the order the
         // checks meet them; the open stops at the first.
         let checked = check::check(&split, ctx).checked_or_first()?;
+        // The arena is sized at the geometry the file was judged at and the
+        // launches at the library's: one instance, or the open is refused.
+        if checked.geom != *kernels.geom() {
+            return Err(refuse(format!(
+                "{}: the file is instance {}, the library is built for {}",
+                path.display(),
+                checked.instance.name,
+                library.instance().name
+            )));
+        }
         let plans = checked.plans;
         let mut stream = device.new_stream()?;
         stream.enable_residency(device.metal())?;
@@ -723,11 +753,16 @@ impl Session {
             .ok_or_else(|| refuse("the stream made no residency set"))?;
         let staged = residency.stage();
         let alloc = Alloc::new(device.metal(), &staged);
-        let arena = Arena::open(alloc, &split, &checked.layout)?;
+        let arena = Arena::open(alloc, &split, &checked.geom, &checked.layout)?;
         let load = started.elapsed();
         let started = Instant::now();
-        let mut rows = RowsArena::open(alloc, &arena, pass_rows_max().min(arena.ctx))?;
-        if copies == MarkCopies::AtOpen {
+        let mut rows = RowsArena::open(alloc, &arena, pass_rows_max(&checked.geom).min(arena.ctx))?;
+        // A file of no recurrent store has nothing a mark copies.
+        let stores = arena
+            .layers
+            .iter()
+            .any(|l| matches!(l.mixer, MixerBufs::Delta(_)));
+        if copies == MarkCopies::AtOpen && stores {
             rows.snaps = Some(SnapBufs::open(alloc, &arena)?);
         }
         let rows_t = started.elapsed();
@@ -743,13 +778,24 @@ impl Session {
             ))
         })?;
         let lens = store_lens(&arena)?;
-        let checkpoints = Checkpoints::open(
-            device.handle().clone(),
-            lens,
-            u64::from(ctx_positions),
-            every,
-        )
-        .map_err(checkpoint_error)?;
+        let checkpoints = (!lens.is_empty())
+            .then(|| {
+                Checkpoints::open(
+                    device.handle().clone(),
+                    lens,
+                    u64::from(ctx_positions),
+                    every,
+                )
+            })
+            .transpose()
+            .map_err(checkpoint_error)?;
+        // The rows arm runs each layer's shared expert with the picks; a file
+        // whose routers run none takes its prompt a step each.
+        let prefill = if arena.layers.iter().all(|l| l.ffn.shared.is_some()) {
+            PrefillMode::Batch
+        } else {
+            PrefillMode::Steps
+        };
         let layers = arena.token_layers();
         Ok(Session {
             stream,
@@ -765,7 +811,7 @@ impl Session {
             checkpoints,
             device: device.handle().clone(),
             rows,
-            prefill: PrefillMode::Batch,
+            prefill,
             open_split: OpenSplit {
                 load,
                 rows: rows_t,
@@ -779,6 +825,12 @@ impl Session {
     #[must_use]
     pub fn open_split(&self) -> OpenSplit {
         self.open_split
+    }
+
+    /// The launch geometry the session runs at: its instance's.
+    #[must_use]
+    pub fn geom(&self) -> &Geometry {
+        &self.arena.geom
     }
 
     /// The token as the count models it.
@@ -1426,7 +1478,9 @@ impl Session {
         }
         self.pos = 0;
         self.poisoned = None;
-        self.checkpoints.clear();
+        if let Some(c) = self.checkpoints.as_mut() {
+            c.clear();
+        }
         self.drop_copies();
         Ok(())
     }
@@ -1441,50 +1495,65 @@ impl Session {
     /// The ledger's counts.
     #[must_use]
     pub fn checkpoint_stats(&self) -> seqstate::Stats {
-        self.checkpoints.stats()
+        self.checkpoints
+            .as_ref()
+            .map_or_else(seqstate::Stats::default, Checkpoints::stats)
     }
 
     /// The checkpoints' positions, ascending.
     #[must_use]
     pub fn checkpoint_positions(&self) -> Vec<u32> {
-        self.checkpoints.positions()
+        self.checkpoints
+            .as_ref()
+            .map_or_else(Vec::new, Checkpoints::positions)
     }
 
-    /// The bytes one checkpoint copies.
+    /// The bytes one checkpoint copies: none with no recurrent store.
     #[must_use]
     pub fn checkpoint_bytes(&self) -> u64 {
-        self.checkpoints.point_bytes()
+        self.checkpoints
+            .as_ref()
+            .map_or(0, Checkpoints::point_bytes)
     }
 
     /// The checkpoints the budget holds.
     #[must_use]
     pub fn checkpoint_capacity(&self) -> usize {
-        self.checkpoints.capacity()
+        self.checkpoints.as_ref().map_or(0, Checkpoints::capacity)
     }
 
-    /// The spacing of a prompt call's inner checkpoints.
+    /// The spacing of a prompt call's inner checkpoints; none with no
+    /// recurrent store.
     #[must_use]
-    pub fn checkpoint_every(&self) -> u32 {
-        self.checkpoints.every()
+    pub fn checkpoint_every(&self) -> Option<u32> {
+        self.checkpoints.as_ref().map(Checkpoints::every)
     }
 
-    /// The positions a prompt call from `from` to `to` takes a checkpoint at.
+    /// The positions a prompt call from `from` to `to` takes a checkpoint at:
+    /// none with no recurrent store.
     #[must_use]
     pub fn checkpoint_marks(&self, from: u32, to: u32) -> Vec<u32> {
-        self.checkpoints.marks(from, to)
+        self.checkpoints
+            .as_ref()
+            .map_or_else(Vec::new, |c| c.marks(from, to))
     }
 
     /// What a cut to at most `n` keeps of the position the session stands at.
+    /// With no recurrent store a cut keeps any position up to it.
     #[must_use]
     pub fn kept(&self, n: u32) -> Kept {
-        self.checkpoints.kept(n, self.pos)
+        match &self.checkpoints {
+            Some(c) => c.kept(n, self.pos),
+            None => Kept::rule(n, self.pos, n.min(self.pos)),
+        }
     }
 
     /// A checkpoint at the position, the stream idle: the token ahead is
     /// waited out and dropped first, then each delta layer's state lane at
     /// the position's parity and its ring are copied once, from the shared
-    /// pages straight into the point's slot. Refused while the session is
-    /// poisoned.
+    /// pages straight into the point's slot. A file of no recurrent store
+    /// has nothing to copy: its caches hold the position. Refused while the
+    /// session is poisoned.
     pub fn checkpoint(&mut self) -> Result<(), SessionError> {
         self.take_point(self.pos, None)
     }
@@ -1519,7 +1588,7 @@ impl Session {
             return Err(SessionError::Poisoned(fault));
         }
         self.quiesce()?;
-        let lane_len = lane_len()?;
+        let lane_len = lane_len(&self.arena.geom)?;
         let live = lane_of(at)
             .checked_mul(lane_len)
             .ok_or_else(|| refuse("a delta state lane's offset overflowed"))?;
@@ -1569,7 +1638,11 @@ impl Session {
                     .ok_or_else(|| refuse("a delta conv ring lies past its buffer"))?,
             );
         }
-        self.checkpoints.take(at, &views).map_err(checkpoint_error)
+        match self.checkpoints.as_mut() {
+            Some(c) => c.take(at, &views).map_err(checkpoint_error),
+            // No recurrent store: the caches hold the position as they are.
+            None => Ok(()),
+        }
     }
 
     /// Cut to position `n`. A cut to 0 resets, which drops the checkpoints. A
@@ -1591,7 +1664,7 @@ impl Session {
             return Ok(());
         }
         self.quiesce()?;
-        let lane_len = lane_len()?;
+        let lane_len = lane_len(&self.arena.geom)?;
         let start = lane_of(n)
             .checked_mul(lane_len)
             .ok_or_else(|| refuse("a delta state lane's offset overflowed"))?;
@@ -1611,7 +1684,19 @@ impl Session {
                 at: Elems(0),
             });
         }
-        match self.checkpoints.cut(n, self.pos, &mut dst) {
+        let cut = match self.checkpoints.as_mut() {
+            Some(c) => c.cut(n, self.pos, &mut dst),
+            // No recurrent store: the caches hold every position below `n`,
+            // and the next step's append overwrites the rows past it.
+            None if n < self.pos => Ok(()),
+            None => {
+                return Err(refuse(format!(
+                    "a cut to {n}, past the position {}",
+                    self.pos
+                )));
+            }
+        };
+        match cut {
             Ok(()) => {}
             // A copy that stopped midway leaves some layers at `n` and the
             // rest where they were: reset, so no step runs on mixed state.
@@ -1647,15 +1732,17 @@ fn checkpoint_error(e: checkpoint::Error) -> SessionError {
     }
 }
 
-/// f32s of one delta state lane.
-fn lane_len() -> Result<usize, SessionError> {
-    state_elems(1).ok_or_else(|| refuse("a delta state lane's length overflowed"))
+/// f32s of one delta state lane at `g`.
+fn lane_len(g: &Geometry) -> Result<usize, SessionError> {
+    g.delta
+        .state_elems(1)
+        .ok_or_else(|| refuse("a delta state lane's length overflowed"))
 }
 
-/// Each delta layer's state lane, then its conv ring. The state buffer is
-/// both lanes; a checkpoint copies one.
+/// Each delta layer's state lane, then its conv ring: none for a file of no
+/// delta layer. The state buffer is both lanes; a checkpoint copies one.
 fn store_lens(arena: &Arena) -> Result<Vec<usize>, SessionError> {
-    let lane_len = lane_len()?;
+    let lane_len = lane_len(&arena.geom)?;
     let both = lane_len
         .checked_mul(LANES)
         .ok_or_else(|| refuse("the delta state's length overflowed"))?;
@@ -1676,9 +1763,6 @@ fn store_lens(arena: &Arena) -> Result<Vec<usize>, SessionError> {
         }
         lens.push(lane_len);
         lens.push(ring_len);
-    }
-    if lens.is_empty() {
-        return Err(refuse("a checkpoint copies no delta layer"));
     }
     Ok(lens)
 }
@@ -2146,11 +2230,19 @@ impl ChainOps for Profiler<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::instance::REGISTERED;
 
     /// A prompt call's inner checkpoints fall between passes: their spacing
     /// is the most rows of one pass.
     #[test]
     fn checkpoint_spacing_is_the_pass_rows() {
-        assert_eq!(pass_rows_max(), CHECKPOINT_EVERY as usize);
+        for inst in REGISTERED {
+            assert_eq!(
+                pass_rows_max(&Geometry::of(inst)),
+                CHECKPOINT_EVERY as usize,
+                "{}",
+                inst.name
+            );
+        }
     }
 }
