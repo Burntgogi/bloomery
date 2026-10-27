@@ -97,6 +97,16 @@ At source `b0fc05e5349330927ceb33ce6f30e584f25ecf4d`, the typed GGUF
 The case is metadata-only and creates no CUDA context; oxide owns its linking.
 It is not fresh NVIDIA execution of the current-main stream/launch paths.
 
+Pinned upstream `95a483fc242d00dec7987efe4a05e24b5f651c1f` subsequently adds the
+split gate/up path that materializes f32 SwiGLU for a down that reads f32.
+The obsolete split-to-f32 refusal is removed, not re-pinned; mismatched gate/up
+forms still refuse by semantic Shape/caller/type data. IQ4_XS follows the shared
+q8x128 predicate in both row dispatch and `writes_h`, so the GLM prompt consumer
+chooses the buffer that is actually written instead of allocating/reading a fake f32 row.
+At source `5abe1ae66b651446938e334331c06683cef793a4`, the actual block metadata
+consumers passed5 cases,0 failed/ignored,34 filtered, including both IQ4 down forms.
+These host cases are not execution evidence for the remaining GPU cases.
+
 On 2026-10-26, source `203f5125a3c48a5b700c6f43318cfcb9c77ff169` executed the owning
 DS41 library on Hikari GPU0 (RTX3090 cc8.6, driver595.91.07):38 passed,0 failed,0 ignored,
 28.61s, including the named IQ4 consumer above. Rust1.99.1 / pinned cuda-oxide9df9e7ce
