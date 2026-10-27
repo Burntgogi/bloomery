@@ -70,6 +70,8 @@ generate_ds41   ds41_ffn_handoff_10_cols_tier            0           0
 generate_ds41   ds41_ffn_handoff_4                       0           0
 generate_ds41   ds41_ffn_handoff_8                       0           0
 generate_ds41   ds41_ffn_handoff_4_tier                  0           0
+# PIN(2026-10-27): ffn_handoff_6_tier at the cc 8.6 scan's value (tools/ref/ptx-shapes.tsv), not measured on cc 12.1, until a GB10 scan runs.
+generate_ds41   ffn_handoff_6_tier                       0           0
 generate_ds41   ds41_ffn_handoff_8_tier                  0           0
 generate_ds41   ds41_ffn_handoff_tier                    0           0
 generate_ds41   ds41_ffn_places                          0           0

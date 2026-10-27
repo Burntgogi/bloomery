@@ -25,8 +25,8 @@ JIT CUDA13.2, Rust1.99.1 / cuda-oxide9df9e7ce / repository patch31ab6a1d3f58).
 Only that measured row is added. Its normalized entry digest is
 `a176a9a5846778e40ba99fc2be637d90` (decl1, 163 lines).
 Measurements establish only physical cc8.6. The other three
-sm_86/sm_121/sm_121a + physical cc12.1 rows remain unmeasured and absent;
-their genuine driver-JIT resource evidence is still required.
+sm_86/sm_121/sm_121a + physical cc12.1 rows remain unmeasured: they carry the entry at the cc8.6
+values under a `PIN(2026-10-27)` until a GB10 scan runs.
 
 ## Host reader status
 
@@ -108,12 +108,11 @@ main; the final-source hardware result must be recorded separately.
 
 The new `ffn_handoff_6_tier` entry needs add-class PTX/JIT/resource and
 owning-gate evidence; the four-slot, eight-slot and other existing entries must remain
-unchanged. No PTX resource pin is added without an observed NVIDIA JIT run.
+unchanged. The cc12.1 tables pin it at the cc8.6 scan's values until an observed NVIDIA JIT run.
 Actual six-slot body/tier and two-card completion remain integration work, not
 capabilities inferred from this primitive.
-`check-ptx-names` remains red until observed spill/JIT-local measurements can pin
-the new entry in the four existing architecture/capability tables. Offline
-no-JIT scans cannot supply that missing column, so no placeholder row is added.
+`check-ptx-names` is green with those pinned rows; a GB10 scan replaces them with the
+observed spill/JIT-local measurements. Offline no-JIT scans cannot supply that column.
 
 
 
