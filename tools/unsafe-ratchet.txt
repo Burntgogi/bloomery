@@ -626,7 +626,7 @@ gguf 7 2 0
 # PIN(2026-10-26): gpu 2691 -> 2693 blocks, the six-slot F32 tier entry adds two blocks:
 # ffn_handoff_6_tier calls handoff_at and handoff_tier_at under its checked launch contract;
 # both blocks state their per-thread bounds and disjoint-write SAFETY invariant.
-# PIN(2026-10-26): gpu 2693 -> 2748 blocks, 346 -> 350 fns: the existing Flint head128 ring
+# PIN(2026-10-27): gpu 2693 -> 2748 blocks, 346 -> 350 fns: the existing Flint head128 ring
 # attention, floor router and expert-input scaling retain their checked SAFETY contracts over
 # main's new kernels; the six-slot entry is already included above. Counted by check-unsafe.sh.
 gpu 2748 350 10

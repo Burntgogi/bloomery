@@ -1441,7 +1441,7 @@ impl HandoffKernels {
                     tsel,
                 )?;
             }
-            _ => {
+            HandoffSlots::Eight => {
                 let prep = self.module.prepare_ds41_ffn_handoff_8_tier(cfg)?;
                 self.module.ds41_ffn_handoff_8_tier(
                     stream,
@@ -1467,6 +1467,12 @@ impl HandoffKernels {
                     sel,
                     tsel,
                 )?;
+            }
+            HandoffSlots::Nine | HandoffSlots::Ten => {
+                return Err(GpuError::shape(
+                    "HandoffKernels::enqueue_handoff_tier",
+                    format!("no F32 tier handoff entry for {slots:?}"),
+                ));
             }
         }
         Ok(())

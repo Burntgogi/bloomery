@@ -2015,6 +2015,10 @@ def self_test():
         line, green, hub = row_line("glm", "glm5-next", small)
         check("a glm5-next file routes to the glm seat", green and "arch=glm5-next route=ok" in line, line)
         check("a tensor-type line parses", "embd=Q3_K exps=gate:Q4_K,down:Q6_K " in line, line)
+        line, green, _ = row_line("glm", "glm5nextx", small)
+        check("a glm5nextx file is refused by name",
+              not green and "arch=glm5nextx route=REFUSED: a glm5nextx file, which no seat serves; the seats are "
+              "--model ds41, qwen38, glm, qwen3, mimo2, solar2, minimaxm3, nemotron, raon1, musespark, flint, decide" in line, line)
         line, green, _ = row_line("glm", "deepseek41", small)
         check("a file the router seats elsewhere is refused for the row's seat",
               not green and "in the ds41 seat, and the README row says glm" in line, line)

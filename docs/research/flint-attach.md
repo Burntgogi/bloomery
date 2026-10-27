@@ -26,8 +26,8 @@ JIT CUDA13.2, Rust1.99.1 / cuda-oxide9df9e7ce / repository patch31ab6a1d3f58).
 Only that measured row is added. Its normalized entry digest is
 `a176a9a5846778e40ba99fc2be637d90` (decl1, 163 lines).
 Measurements establish only physical cc8.6. The other three
-sm_86/sm_121/sm_121a + physical cc12.1 rows remain unmeasured and absent;
-their genuine driver-JIT resource evidence is still required.
+sm_86/sm_121/sm_121a + physical cc12.1 rows remain unmeasured: they carry the entry at the cc8.6
+values under a `PIN(2026-10-27)` until a GB10 scan runs.
 
 ## Host reader status
 
@@ -278,56 +278,19 @@ places through the production tier accumulator and adds the host sum. It covers 
 widths, invalid ids, poisoned non-owning rows, trailing sentinels and changed replay
 weights. Its host sum is precomputed and activation images are checked by
 readback: it is not expert execution or two-card completion/publication proof.
-Hardware evidence must name its actual source; a component PR's result is not a
-fresh execution of the combined Flint integration.
+Earlier integrated-source results do not verify this branch after its merge with current
+main; the final-source hardware result must be recorded separately.
 
 The new `ffn_handoff_6_tier` entry needs add-class PTX/JIT/resource and
 owning-gate evidence; the four-slot, eight-slot and other existing entries must remain
-unchanged. No PTX resource pin is added without an observed NVIDIA JIT run.
+unchanged. The cc12.1 tables pin it at the cc8.6 scan's values until an observed NVIDIA JIT run.
 Actual six-slot body/tier and two-card completion remain integration work, not
 capabilities inferred from this primitive.
-`check-ptx-names` remains red until observed spill/JIT-local measurements can pin
-the new entry in the four existing architecture/capability tables. Offline
-no-JIT scans cannot supply that missing column, so no placeholder row is added.
+`check-ptx-names` is green with those pinned rows; a GB10 scan replaces them with the
+observed spill/JIT-local measurements. Offline no-JIT scans cannot supply that column.
 
-### Integrated runtime consumer and NVIDIA handoff
 
-`crates/gpu-flint` loads the validated `ModelSpec`, actual selected projection/expert forms and
-host/NVMe source through the common hosted loader. It implements the common chain, tier,
-rollback and resident-slot interfaces. `app::flint` and `bloomery-serve --model flint` use the
-existing hybrid/tiered seats, tokenizer, original chat template and stop handling.
 
-Head128 attention keeps NoPE and NeoX independent of the readable window, stores f16 KV, and
-uses `Rows::Ring.count` for capacity and checked chunking. For the released model, per-slot KV is
-`2048 * (14*C + 35*min(C,1024))` bytes. Slot state retains high-water positions: at a filled
-1024-row ring a 512-token cut is retained, whereas 513 tokens require reset/refeed.
-
-The routed/shared block loads `(routed + shared) + residual` and the reference's activated-input
-protection: `exp(ceil(log(amax / 1024) * log2(e)).clamp(0,127) * log(2))`. The down output is
-restored before route weighting; this is not an activation clamp. Legacy models keep their
-previous residual association and direct expert inputs without scale buffers or added launches.
-Prompt and tier reservations include the actual optional scales and selected buffer unions.
-
-Run the owning model-free gates `gate-gpu-flint-attn` and `gate-gpu-flint-router`, then the
-full-file `gate-gpu-flint-lib` with the complete GGUF passed through `BLOOMERY_BOX_ENV`.
-Its ignored hardware case compares eager/captured logits, interleaved resident slots,
-reset/refeed and retained/refused ring-boundary transitions. The test must be executed, not
-counted as a pass because it compiles or remains ignored.
-
-NVIDIA acceptance also requires the affected shared expert/residency/tier regressions, exact-head
-oracle comparisons and the existing per-architecture spill/JIT/resource checks. Ten new entries
-currently lack genuine measurements in the four pinned architecture/capability tables; no zero,
-placeholder or copied hardware pin is supplied. Keep the integration Draft until that evidence
-is produced. No ROCm implementation or AMD execution is implied by this CUDA attachment.
-
-Local CPU smoke on the complete artifact exercised all 47 routed layers with six fixed selected
-experts, two columns and input amplitudes 1/8192. Single-column and union execution compared
-385,024 f32 cells bit-for-bit (zero differences), with finite outputs and bounded protected
-activations. This is actual expert-weight execution, not a whole-model decode or GPU oracle.
-A separate public planner consumer checked group sizes 1/8, contexts 512/1024/2048 and slots 1/3;
-all 12 plans conserved full/window KV bytes and repeated group configuration charged no second reserve.
-The compiled CLI lists the Flint seat; opening it on this AMD-only machine stops at the named
-NVIDIA R580+/`libcuda.so.1` prerequisite, so no HTTP generation run is reported.
 
 ## 1. Sources and observed artifact
 
