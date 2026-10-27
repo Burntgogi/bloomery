@@ -765,6 +765,34 @@ mod tests {
         );
     }
 
+    // PIN(2026-10-16): the dense pairs gain NVFP4 (`nvfp4_gemv` through
+    // `site::kgemv`); every other pair is unchanged.
+    // PIN(2026-10-19): and bloomery's own MXFP8 (`mxfp8_gemv` through
+    // `site::gemv`); every other pair is unchanged.
+    // PIN(2026-10-20): and bloomery's own FP8_B128 (`fp8_b128_gemv` through
+    // `site::gemv`); BF16 also uses `bf16_gemv` and `bf16_tile_gemm` over its words.
+    // PIN(2026-10-26): IQ4_XS adds the existing selected GEMV as an ordinary site (UTC).
+    #[test]
+    fn dense_admits_exactly_the_pinned_pairs() {
+        assert_eq!(
+            rows(dense),
+            [
+                (GgmlType::F32, SiteEntry::F32),
+                (GgmlType::Q5_0, SiteEntry::Q5_0),
+                (GgmlType::Q8_0, SiteEntry::Q8_0),
+                (GgmlType::Q3_K, SiteEntry::Q3k),
+                (GgmlType::Q4_K, SiteEntry::Q4k),
+                (GgmlType::Q5_K, SiteEntry::Q5k),
+                (GgmlType::Q6_K, SiteEntry::Q6k),
+                (GgmlType::BF16, SiteEntry::Bf16),
+                (GgmlType::NVFP4, SiteEntry::Nvfp4),
+                (GgmlType::IQ4_XS, SiteEntry::Iq4xs),
+                (GgmlType::MXFP8, SiteEntry::Mxfp8),
+                (GgmlType::FP8_B128, SiteEntry::Fp8B128),
+            ]
+        );
+    }
+
     // PIN(2026-10-20): the GEMM pairs gain NVFP4 (`gemm_nvfp4p` over its
     // planes); every other pair is unchanged.
     // PIN(2026-10-21): and IQ2_XXS (`gemm_iq2xxs`, which `GemmWeight` already
@@ -800,32 +828,6 @@ mod tests {
                 (GgmlType::IQ4_XS, GemmEntry::Iq4xs),
                 (GgmlType::IQ1_M, GemmEntry::Iq1m),
                 (GgmlType::NVFP4_ROWS, GemmEntry::Nvfp4),
-            ]
-        );
-    }
-
-    // PIN(2026-10-16): the dense pairs gain NVFP4 (`nvfp4_gemv` through
-    // `site::kgemv`); every other pair is unchanged.
-    // PIN(2026-10-19): and bloomery's own MXFP8 (`mxfp8_gemv` through
-    // `site::gemv`); every other pair is unchanged.
-    // PIN(2026-10-20): and bloomery's own FP8_B128 (`fp8_b128_gemv` through
-    // `site::gemv`); BF16 also uses `bf16_gemv` and `bf16_tile_gemm` over its words.
-    #[test]
-    fn dense_admits_exactly_the_pinned_pairs() {
-        assert_eq!(
-            rows(dense),
-            [
-                (GgmlType::F32, SiteEntry::F32),
-                (GgmlType::Q5_0, SiteEntry::Q5_0),
-                (GgmlType::Q8_0, SiteEntry::Q8_0),
-                (GgmlType::Q3_K, SiteEntry::Q3k),
-                (GgmlType::Q4_K, SiteEntry::Q4k),
-                (GgmlType::Q5_K, SiteEntry::Q5k),
-                (GgmlType::Q6_K, SiteEntry::Q6k),
-                (GgmlType::BF16, SiteEntry::Bf16),
-                (GgmlType::NVFP4, SiteEntry::Nvfp4),
-                (GgmlType::MXFP8, SiteEntry::Mxfp8),
-                (GgmlType::FP8_B128, SiteEntry::Fp8B128),
             ]
         );
     }
@@ -872,14 +874,13 @@ mod tests {
         );
     }
 
-    /// The layout a file tensor of each type loads in, and the one a routed
-    /// stack loads in under the default expert rule: every type's but q5_K's,
-    /// which that rule does not admit, and mxfp8's, which has no card expert
-    /// entry.
+    /// The layout of each file type and its default routed layout: Q5_K,
+    /// MXFP8 and IQ4_XS require a program-specific routed rule.
     // PIN(2026-10-23): NVFP4_ROWS loads as NVFP4's planes (its routed card
     // columns); every other pair is unchanged.
     // PIN(2026-10-25): IQ2_XS, IQ1_S, IQ2_S and IQ1_M load as the file's
     // blocks, as IQ2_XXS does; every other pair is unchanged.
+    // PIN(2026-10-26): ordinary IQ4_XS matrices retain their file blocks (UTC).
     #[test]
     fn the_card_layouts_are_the_pinned_pairs() {
         assert_eq!(
@@ -900,6 +901,7 @@ mod tests {
                 (GgmlType::IQ2_XS, CardFormat::KQuant),
                 (GgmlType::IQ1_S, CardFormat::KQuant),
                 (GgmlType::IQ2_S, CardFormat::KQuant),
+                (GgmlType::IQ4_XS, CardFormat::KQuant),
                 (GgmlType::IQ1_M, CardFormat::KQuant),
                 (GgmlType::MXFP8, CardFormat::Mxfp8Planes),
                 (GgmlType::NVFP4_ROWS, CardFormat::Nvfp4Planes),
@@ -907,8 +909,8 @@ mod tests {
             ]
         );
         for ty in ALL {
-            let routed =
-                CardFormat::of(ty).filter(|_| !matches!(ty, GgmlType::Q5_K | GgmlType::MXFP8));
+            let routed = CardFormat::of(ty)
+                .filter(|_| !matches!(ty, GgmlType::Q5_K | GgmlType::MXFP8 | GgmlType::IQ4_XS));
             assert_eq!(CardFormat::of_routed(ty), routed, "{ty:?}");
         }
     }
@@ -957,6 +959,7 @@ mod tests {
                 GgmlType::IQ2_XS,
                 GgmlType::IQ1_S,
                 GgmlType::IQ2_S,
+                GgmlType::IQ4_XS,
                 GgmlType::IQ1_M,
             ]
         );

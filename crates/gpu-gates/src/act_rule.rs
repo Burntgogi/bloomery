@@ -237,8 +237,11 @@ impl SiteRel {
 #[must_use]
 pub fn site_rel(ty: GgmlType, arm: Arm) -> Option<SiteRel> {
     let ours = match (ty, arm) {
-        (GgmlType::Q3_K | GgmlType::Q4_K | GgmlType::Q5_K | GgmlType::Q6_K, _)
-        | (GgmlType::IQ3_XXS | GgmlType::IQ4_XS, Arm::Expert) => Some(Q8_1_BLOCK),
+        (
+            GgmlType::Q3_K | GgmlType::Q4_K | GgmlType::Q5_K | GgmlType::Q6_K | GgmlType::IQ4_XS,
+            _,
+        )
+        | (GgmlType::IQ3_XXS, Arm::Expert) => Some(Q8_1_BLOCK),
         // Bolt's IQ2_XXS: the routed `iq2_xxs_gemv_sel` and the dense `iq2_xxs_rows` read q8_1.
         (GgmlType::IQ2_XXS, Arm::Expert | Arm::Gemv) => Some(Q8_1_BLOCK),
         // Bolt's dense NVFP4 (`nvfp4_gemv`, the ssm_in/ssm_out) reads the engine's q8_1.
@@ -993,6 +996,11 @@ mod site_tests {
         let (q32, q128, q256) = (Some(32), Some(Q8_1_BLOCK), Some(QK_K));
         for arm in [Arm::Gemv, Arm::Gemm, Arm::Expert] {
             assert_eq!(site_rel(GgmlType::Q3_K, arm), q(q256, q128), "Q3_K {arm:?}");
+            assert_eq!(
+                site_rel(GgmlType::IQ4_XS, arm),
+                q(q256, q128),
+                "IQ4_XS {arm:?}"
+            );
             for ty in [GgmlType::Q4_K, GgmlType::Q5_K, GgmlType::Q6_K] {
                 assert_eq!(site_rel(ty, arm), q(q32, q128), "{ty} {arm:?}");
             }
@@ -1026,7 +1034,6 @@ mod site_tests {
             for ty in [
                 GgmlType::IQ3_S,
                 GgmlType::IQ3_XXS,
-                GgmlType::IQ4_XS,
                 GgmlType::Q5_1,
                 GgmlType::IQ4_NL,
             ] {
@@ -1091,8 +1098,11 @@ mod site_tests {
             read("gemm/mod.rs"),
             read("gemm/grouped.rs"),
         );
+        // The contract is the arm's text, not rustfmt's wrapping of its or-pattern.
+        let site = site.split_whitespace().collect::<Vec<_>>().join(" ");
         for line in [
-            "SiteEntry::Q3k | SiteEntry::Q4k | SiteEntry::Q5k | SiteEntry::Q6k => SiteAct::Q8x128",
+            // PIN(2026-10-27): IQ4_XS reads the 128-value q8_1 form with the K-quants (`SiteEntry::Iq4xs`), as `site_rel` says.
+            "SiteEntry::Q3k | SiteEntry::Q4k | SiteEntry::Q5k | SiteEntry::Q6k | SiteEntry::Iq4xs => SiteAct::Q8x128",
             "SiteEntry::Q8_0 => SiteAct::Q8x32",
             "SiteEntry::F32 => SiteAct::F32",
             "SiteEntry::Q5_0 => SiteAct::Q8Blocks32",

@@ -2,8 +2,8 @@
 
 Design snapshot: **`e53cabebbb9b16249c81b7c26a026da1670f7d9d`**, requested by
 [#632](https://github.com/midagedev/bloomery/issues/632). The source-gap observations below describe
-that snapshot. This component tree has a header-only reader, shared tier-handoff work and selected
-common-leg work, but no Flint body, app session or serve seat. Primitive GPU evidence is not Flint model admission.
+that snapshot. This component tree has a header-only reader, shared tier-handoff work, the ordinary
+IQ4_XS shared site and selected common-leg work, but no Flint body, app session or serve seat. Primitive GPU evidence is not Flint model admission.
 
 ## Six-slot handoff closure checks — 2026-10-26
 
@@ -113,6 +113,56 @@ Actual six-slot body/tier and two-card completion remain integration work, not
 capabilities inferred from this primitive.
 `check-ptx-names` is green with those pinned rows; a GB10 scan replaces them with the
 observed spill/JIT-local measurements. Offline no-JIT scans cannot supply that column.
+
+### Ordinary IQ4_XS shared-site implementation
+
+IQ4_XS now has an ordinary file-layout/dense entry in QROWS and a common site family.
+The loader keeps its original block words; `site::kgemv` uses the existing IQ4_XS
+entry over one matrix and `site::gemm` uses the existing grouped GEMM. The common
+gated block selects a split gate/up and sizes the down's q8_1 scratch from the
+actual activation form. Its column walk and the shared wide-prompt owner use
+those same sites. IQ4_XS is not relabeled as a routed expert or requantized.
+
+`hw_iq4_shared_loads_and_runs_narrow_columns_and_wide_replay`, owned by
+`gate-gpu-ds41-lib`, covers real packed-weight loading, unchanged stored words,
+the ordinary `SharedExpert` layout, unequal matrix widths, one/eight-column block
+execution and the wide-prompt transition/captured replay. Wide scratch holds only
+the q8_1 input and down forms these sites read. Its nonnegative constant-weight
+case derives a scalar floating-operation bound; uniform codes do not detect nibble
+decode ordering. That remains a separate IQ4 kernel-gate obligation, not a
+whole-model accuracy pin or a claim made by this wrapper fixture.
+
+The pinned current-main merge (`cb8d92ebddd1ce1a325a15450c06a01f57ecf88c`) also
+reconciles its existing Qwen3.8 projected-site consumer: `site::PROJECTED` includes
+IQ4_XS, and selected dispatch uses the supplied stream. Projected attention/shared
+sites are admitted; the K=640 shared down and unsupported types/shapes remain refused.
+This reuses the existing program and kernel, not a new model implementation.
+
+The typed GGUF test `a_site_type_comes_from_the_header_and_a_type_with_no_launch_is_refused`
+reads an IQ4_XS shared site through `PROJECTED`, not merely `ALL`. It refuses IQ3_S, another
+shape and a type outside the allowed list by name. It is metadata-only and creates no CUDA context.
+
+Pinned upstream `95a483fc242d00dec7987efe4a05e24b5f651c1f` subsequently adds the
+split gate/up path that materializes f32 SwiGLU for a down that reads f32.
+The obsolete split-to-f32 refusal is removed, not re-pinned; mismatched gate/up
+forms still refuse by semantic Shape/caller/type data. IQ4_XS follows the shared
+q8x128 predicate in both row dispatch and `writes_h`, so the GLM prompt consumer
+chooses the buffer that is actually written instead of allocating/reading a fake f32 row.
+At source `5abe1ae66b651446938e334331c06683cef793a4`, the actual block metadata
+consumers passed5 cases,0 failed/ignored,34 filtered, including both IQ4 down forms.
+These host cases are not execution evidence for the remaining GPU cases.
+
+On 2026-10-26, source `203f5125a3c48a5b700c6f43318cfcb9c77ff169` executed the owning
+DS41 library on Hikari GPU0 (RTX3090 cc8.6, driver595.91.07):38 passed,0 failed,0 ignored,
+28.61s, including the named IQ4 consumer above. Rust1.99.1 / pinned cuda-oxide9df9e7ce
+with repository patch31ab6a1d3f58 and LLVM21.1.8 were used.
+Its canonical comparison to main15778e2c covered4bins/8carriers/1657entries: all identical,
+non-JIT resource rows equal; no JIT-resource comparison is claimed.
+All-target native Clippy/formatting and source203f5125 GitHub T0/lint passed.
+These are source-specific historical results, not another hardware execution of
+later diagnostic, test or documentation changes. Wider affected real-model,
+placement and residency coverage remains explicit; this does not establish a
+Flint oracle, physical cc12.1, ROCm or performance.
 
 ### Selected expert arms and tier scratch
 
