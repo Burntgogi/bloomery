@@ -2,8 +2,31 @@
 
 Design snapshot: **`e53cabebbb9b16249c81b7c26a026da1670f7d9d`**, requested by
 [#632](https://github.com/midagedev/bloomery/issues/632). The source-gap observations below describe
-that snapshot. This component tree has a header-only reader and selected common-leg work,
-not a Flint body, app session or serve seat. Primitive evidence below is not model admission.
+that snapshot. This component tree additionally has a header-only reader and shared tier-handoff
+work, but no Flint body, app session or serve seat. Primitive GPU evidence is not Flint model admission.
+
+## Six-slot handoff closure checks — 2026-10-26
+
+The existing #781 branch was ordinarily merged with main
+`15778e2cb2dd7af428d2dd14259e6b0ea8ca6b89`; its published history was not rewritten.
+On source `9bfa55adc257f7e6aae4952aca06246eddaeef70`, the owning DS41 library ran on
+Hikari's RTX 3090 (GPU0): **38 passed, 0 failed, 0 ignored**, in 28.75 seconds.
+`hw_f32_tier_handoffs_conserve_consumed_routes` exercised four, six and eight routes,
+including partial widths, invalid IDs, poisoned unconsumed rows and changed-input graph replay.
+The following host-only changes format the guard and replace a redundant slot-dependent
+error label with the common `F32 tier handoff` context. The measured common-name census
+falls from 39 to 37; the ABI-stable generated kernel names and dispatch stay unchanged.
+The earlier GPU run is not relabeled as a run of these later commits.
+
+The actual `generate_ds41` carrier at `b9b6e013ebfab5748688be52e9a5d398ac2fc9a3`
+subsequently measured `ffn_handoff_6_tier` on sm_86 / physical cc8.6:
+ptxas13.3.33 spill0, driver-JIT local0, both register counts26 (driver595.91.07,
+JIT CUDA13.2, Rust1.99.1 / cuda-oxide9df9e7ce / repository patch31ab6a1d3f58).
+Only that measured row is added. Its normalized entry digest is
+`a176a9a5846778e40ba99fc2be637d90` (decl1, 163 lines).
+Measurements establish only physical cc8.6. The other three
+sm_86/sm_121/sm_121a + physical cc12.1 rows remain unmeasured: they carry the entry at the cc8.6
+values under a `PIN(2026-10-27)` until a GB10 scan runs.
 
 ## Host reader status
 
@@ -159,6 +182,30 @@ The host-only public planner consumer covers one-byte boundaries before the firs
 and before adding another down form, plus descriptor overflow refusal. These and the CUDA consumer
 are not a whole-model oracle or every affected model/residency gate; canonical equality does not
 waive changed host/allocation consumers. Flint's `Program` admission and body/app/seat remain absent.
+### Six-slot F32 tier handoff implementation
+
+`HandoffKernels::enqueue_handoff_tier` now selects a genuine six-slot F32 entry
+beside the existing four- and eight-slot entries. Both host and tier layouts must have the
+same supported slot count and activation width; compressed tier images remain
+refused. The entry uses the existing copy/place/fault helpers and the existing
+subsequent go/publication protocol; no Flint router or Program is registered.
+
+`hw_f32_tier_handoffs_conserve_consumed_routes`, owned by
+`gate-gpu-ds41-lib`, consumes the four-, six- and eight-slot handoffs' weights and emitted
+places through the production tier accumulator and adds the host sum. It covers partial
+widths, invalid ids, poisoned non-owning rows, trailing sentinels and changed replay
+weights. Its host sum is precomputed and activation images are checked by
+readback: it is not expert execution or two-card completion/publication proof.
+Earlier integrated-source results do not verify this branch after its merge with current
+main; the final-source hardware result must be recorded separately.
+
+The new `ffn_handoff_6_tier` entry needs add-class PTX/JIT/resource and
+owning-gate evidence; the four-slot, eight-slot and other existing entries must remain
+unchanged. The cc12.1 tables pin it at the cc8.6 scan's values until an observed NVIDIA JIT run.
+Actual six-slot body/tier and two-card completion remain integration work, not
+capabilities inferred from this primitive.
+`check-ptx-names` is green with those pinned rows; a GB10 scan replaces them with the
+observed spill/JIT-local measurements. Offline no-JIT scans cannot supply that column.
 
 
 

@@ -74,6 +74,10 @@ generate_ds41   ds41_ffn_handoff_10_cols_tier            0           0
 generate_ds41   ds41_ffn_handoff_4                       0           0
 generate_ds41   ds41_ffn_handoff_8                       0           0
 generate_ds41   ds41_ffn_handoff_4_tier                  0           0
+# PIN(2026-10-26): ffn_handoff_6_tier measured from generate_ds41 at b9b6e013 with
+# Rust1.99.1 / cuda-oxide9df9e7ce + repository patch31ab6a1d3f58; sm_86 ptxas13.3.33,
+# RTX3090 cc8.6 driver595.91.07 JIT CUDA13.2: spill0 / jit_local0 (both register counts26).
+generate_ds41   ffn_handoff_6_tier                       0           0
 generate_ds41   ds41_ffn_handoff_8_tier                  0           0
 generate_ds41   ds41_ffn_handoff_9                       0           0
 generate_ds41   ds41_ffn_handoff_tier                    0           0
