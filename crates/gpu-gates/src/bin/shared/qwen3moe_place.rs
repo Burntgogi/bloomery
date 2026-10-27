@@ -271,9 +271,9 @@ fn laid(
         [stage] => workstation::placed_with_arena(*stage, layers, arena),
         [stage, tier] => {
             let batch = match inputs {
-                Inputs::Qwen3(i) => q3::tier_batch(&i.hp),
-                Inputs::Qwen35(i) => q35::leg_tier_batch(&i.spec),
-            };
+                Inputs::Qwen3(i) => q3::tier_batch(i),
+                Inputs::Qwen35(i) => q35::leg_tier_batch(i),
+            }?;
             let mut machine = workstation::plan_tiers(layers, *stage, &[*tier], None, batch)?;
             q3::stage_placed(&mut machine, arena);
             machine
@@ -2099,7 +2099,7 @@ pub(super) mod tests {
 
     /// A dense qwen35 file (no router) plans through [`PlaceQ3::qwen35_on`]: its machine counts
     /// the whole load's ubatch arena, as the load sizes it, not a placed arena, which a file with
-    /// no router refuses; and the plan answers at the load's context.
+    /// no router refuses; an expert tier is refused by name through the same consumer.
     #[allow(
         dead_code,
         reason = "`generate_qwen3moe`'s test calls it; every other bin that includes this file leaves it unused"
@@ -2137,6 +2137,27 @@ pub(super) mod tests {
         assert_eq!(workstation::counted_arena_bytes(&q.machine.cards[0]), arena);
         q.plan(o.ctx, &PlanLevers::default())
             .unwrap_or_else(|e| panic!("the dense plan at {}: {e}", o.ctx));
+        let tier = DeviceInfo {
+            ordinal: 1,
+            name: "NVIDIA RTX 3090".to_owned(),
+            total_bytes: 25_769_803_776,
+            free_bytes: 25_000_000_000,
+            uuid: [2; 16],
+            pci_bus: "0000:81:00.0".to_owned(),
+            held_by: None,
+            integrated: false,
+        };
+        let census = [census.into_iter().next().expect("the stage card"), tier];
+        let two = Place::parse("cuda0+1").expect("two card words");
+        let refusal =
+            match PlaceQ3::qwen35_on(&split, two, &census, o, Seqs::ONE, Beside::default()) {
+                Err(e) => e,
+                Ok(_) => panic!("a dense model cannot use an expert tier"),
+            };
+        assert!(matches!(
+            refusal.downcast_ref::<PlacementError>(),
+            Some(PlacementError::Metadata { key, .. }) if key == "Qwen3.6 expert tier"
+        ));
         std::fs::remove_file(&path).expect("the header file");
     }
 }

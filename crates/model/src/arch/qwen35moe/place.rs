@@ -52,7 +52,7 @@ use super::hparams::Kind;
 use super::{mtp, names};
 use crate::arch::{architecture_is, coverage};
 use crate::placement::accepts::{
-    Program, leg_card_format, program_of, qwen38_down, qwen38_gate_up, routed_rule,
+    Program, leg_card_format, leg_down_forms, program_of, qwen38_down, qwen38_gate_up, routed_rule,
 };
 use crate::placement::ctx::{CtxLimit, PastLimit, check_slot_ctx};
 use crate::placement::ctx_ask::PlanRefusal;
@@ -1498,17 +1498,19 @@ pub const LEG_TIER_CHUNK: u64 = 8;
 /// card's staging, one chunk of the leg's scratch and the host's rows, for
 /// blocks of the host union's columns. [`tier_batch`] is the qwen4exp plan's
 /// figure.
-#[must_use]
-pub fn leg_tier_batch(spec: &ModelSpec) -> TierBatchBytes {
-    let (expert_ff, n_used) = spec
-        .routed()
-        .map_or((0, 0), |m| (u64::from(m.expert_ff), u64::from(m.top_k)));
-    workstation::tier_leg_batch_bytes(
+pub fn leg_tier_batch(inputs: &PlanInputs) -> Result<TierBatchBytes, PlacementError> {
+    let spec = &inputs.spec;
+    let moe = spec.routed().ok_or_else(|| PlacementError::Metadata {
+        key: "Qwen3.6 expert tier".into(),
+        detail: "a dense model has no routed experts for an expert tier".into(),
+    })?;
+    let (expert_ff, n_used) = (u64::from(moe.expert_ff), u64::from(moe.top_k));
+    workstation::try_tier_leg_batch_bytes_of(
         u64::from(spec.hidden),
         expert_ff,
         n_used,
-        LEG_TIER_CHUNK,
-        crate::moe::UNION_MAX_COLS as u64,
+        (LEG_TIER_CHUNK, crate::moe::UNION_MAX_COLS as u64),
+        leg_down_forms(Program::Qwen35Body, &inputs.model),
     )
 }
 
@@ -1543,6 +1545,7 @@ const fn tier_batch_of(n_embd: u64, n_used: u64, ubatch: u64) -> TierBatchBytes 
         staging: tier_batch_staging_bytes(n_embd, n_used, cols),
         scratch: tier_route_scratch_bytes(cols),
         host: tier_batch_host_bytes(n_embd, n_used, cols),
+        leg: None,
     }
 }
 
@@ -2508,6 +2511,7 @@ fn draft_machine() -> Machine {
     Machine {
         cards: vec![Card {
             name: "mtp draft".to_string(),
+            tier_leg: None,
             device: None,
             usable_bytes: u64::MAX,
             context_bytes: 0,
@@ -3092,6 +3096,7 @@ mod tests {
             Machine {
                 cards: vec![Card {
                     name: "card".to_string(),
+                    tier_leg: None,
                     device: None,
                     usable_bytes: usable,
                     context_bytes: 0,
@@ -3920,6 +3925,7 @@ mod tests {
             Machine {
                 cards: vec![Card {
                     name: "card".to_string(),
+                    tier_leg: None,
                     device: None,
                     usable_bytes: 1 << 40,
                     context_bytes: 0,
@@ -4834,6 +4840,7 @@ mod tests {
                     staging: 496_730_112,
                     scratch: 348_980_248,
                     host: 839_188_480,
+                    leg: None,
                 }
             );
             assert_eq!(
@@ -4842,6 +4849,7 @@ mod tests {
                     staging: 62_091_264,
                     scratch: 87_233_816,
                     host: 104_898_560,
+                    leg: None,
                 }
             );
         }

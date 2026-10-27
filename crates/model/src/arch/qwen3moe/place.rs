@@ -19,7 +19,7 @@ use gguf::Split;
 
 use super::hparams::Hparams;
 use super::roles;
-use crate::placement::accepts::{Program, routed_rule};
+use crate::placement::accepts::{Program, leg_down_forms, routed_rule};
 use crate::placement::ctx_ask::PlanRefusal;
 use crate::placement::workstation::{self, TierBatchBytes};
 use crate::placement::{
@@ -45,14 +45,14 @@ pub const TIER_CHUNK: u64 = 8;
 /// The expert tier's prompt-batch bytes ([`TierBatchBytes`]) for blocks of
 /// the host union's columns ([`crate::moe::UNION_MAX_COLS`]): the tier card's
 /// staging, one chunk of the card leg's scratch and the host's rows.
-#[must_use]
-pub fn tier_batch(hp: &Hparams) -> TierBatchBytes {
-    workstation::tier_leg_batch_bytes(
+pub fn tier_batch(inputs: &PlanInputs) -> Result<TierBatchBytes, PlacementError> {
+    let hp = &inputs.hp;
+    workstation::try_tier_leg_batch_bytes_of(
         hp.n_embd as u64,
         hp.experts.ff as u64,
         hp.experts.n_used as u64,
-        TIER_CHUNK,
-        crate::moe::UNION_MAX_COLS as u64,
+        (TIER_CHUNK, crate::moe::UNION_MAX_COLS as u64),
+        leg_down_forms(PROGRAM, &inputs.model),
     )
 }
 

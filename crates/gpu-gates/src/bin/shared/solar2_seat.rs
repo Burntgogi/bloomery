@@ -84,7 +84,7 @@ pub fn open(file: &Path, ctx: usize, arm: Arm) -> Result<Box<dyn Seat>, GateErro
     inputs.room = (PLAN_ROOM, HostRead::Given);
     // Plan (b′): the stage on the largest card, the next-largest an expert tier under the host tier, holding the tier's
     // prompt-batch bytes the file's widths give.
-    let machine = arm.machine(inputs.model.layers, place::tier_batch(&inputs.hp))?;
+    let machine = arm.machine(inputs.model.layers, place::tier_batch(&inputs)?)?;
     let place = PlanLevers::from_levers(&levers)?;
     let plan = inputs.plan(&machine, u64::try_from(ctx)?, &place)?;
     let mut m = Body::open_placed(split, &plan, &inputs, 0, levers.host())?;

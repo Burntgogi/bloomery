@@ -225,6 +225,7 @@ mod tests {
             token_embedding: false,
             reserves: Vec::new(),
             reserve_only: false,
+            tier_leg: None,
         }
     }
 

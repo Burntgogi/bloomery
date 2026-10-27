@@ -87,6 +87,7 @@ impl LegFamily for MuseSpark {
             n_used: hp.n_used,
             n_embd: hp.latent,
             ff: hp.expert_width(),
+            program: model::placement::accepts::Program::MuseSparkBody,
         }
     }
 

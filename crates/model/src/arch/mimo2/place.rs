@@ -119,8 +119,7 @@ pub const TIER_CHUNK: u64 = 16;
 /// plan's rule carries reads (the rule's down arm is the leg's `Q8Act` downs), and the host's rows
 /// and places ([`workstation::tier_leg_batch_bytes`]). The plan reserves them on the tier card and
 /// the host, and the load checks its allocations against them.
-#[must_use]
-pub fn tier_batch(hp: &Hparams, cols: u64) -> TierBatchBytes {
+pub fn tier_batch(hp: &Hparams, cols: u64) -> Result<TierBatchBytes, PlacementError> {
     workstation::tier_leg_batch_bytes(
         hp.n_embd as u64,
         hp.expert_ff as u64,
@@ -266,18 +265,12 @@ mod tests {
         let inputs = PlanInputs::describe(&split).expect("the synthetic header describes");
         let _ = std::fs::remove_file(&path);
         let hp = &inputs.hp;
-        assert_eq!(
-            tier_batch(hp, COLS),
-            workstation::tier_leg_batch_bytes(
-                hp.n_embd as u64,
-                hp.expert_ff as u64,
-                hp.n_used as u64,
-                TIER_CHUNK,
-                COLS,
-            )
-        );
         let routed = runtime::layer::hosted(&inputs.spec.layers).map_or(0, |run| run.len());
-        let tiered = workstation::plan_bp(hp.n_trunk, None, tier_batch(hp, COLS));
+        let tiered = workstation::plan_bp(
+            hp.n_trunk,
+            None,
+            tier_batch(hp, COLS).expect("valid tier geometry"),
+        );
         let plain = workstation::plan_gate(hp.n_trunk);
         assert_eq!(
             inputs.prompt_batch_bytes(&plain).expect("a plain machine"),

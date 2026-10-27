@@ -14,9 +14,10 @@ use super::hparams::Hparams;
 use super::{roles, spec};
 use crate::arch::chat_of;
 use crate::arch::place_hybrid;
+use crate::placement::accepts::{Program, leg_down_forms};
 use crate::placement::kernels::q8_act_bytes;
 use crate::placement::workstation::TierBatchBytes;
-use crate::placement::{PlacementError, workstation};
+use crate::placement::{ModelTensors, PlacementError, workstation};
 
 pub use place_hybrid::{GEMM_TILE_COLS, GEMM32_STEP, KvLayout, PlaceError};
 use place_hybrid::{route_bytes, tier_places_bytes, wide_bytes};
@@ -40,18 +41,18 @@ pub const PARTIAL_ROWS: usize = 8;
 /// the stage card's card experts, which the body binds to its own constant.
 pub const TIER_CHUNK: u64 = 8;
 
-/// The expert tier's prompt-batch bytes ([`TierBatchBytes`]) for a file of hyperparameters `hp`:
+/// The expert tier's prompt-batch bytes ([`TierBatchBytes`]) for a described file:
 /// the tier card's staging, the leg's chunk scratch and the host's rows and places, for blocks of
 /// the host union's columns. The plan reserves them on the tier card and the host, and the load
 /// checks its allocations against them.
-#[must_use]
-pub fn tier_batch(hp: &Hparams) -> TierBatchBytes {
-    workstation::tier_leg_batch_bytes(
+pub fn tier_batch(inputs: &PlanInputs) -> Result<TierBatchBytes, PlacementError> {
+    let hp = &inputs.hp;
+    workstation::try_tier_leg_batch_bytes_of(
         hp.n_embd as u64,
         hp.experts.ff as u64,
         hp.experts.n_used as u64,
-        TIER_CHUNK,
-        crate::moe::UNION_MAX_COLS as u64,
+        (TIER_CHUNK, crate::moe::UNION_MAX_COLS as u64),
+        leg_down_forms(Program::Solar2Body, &inputs.model),
     )
 }
 
@@ -89,8 +90,12 @@ const fn acts_bytes(k: usize) -> usize {
 /// The wide forms are a bound: both forms at each width that allows them, where the load makes
 /// the ones its sites' types read. The units a prefill group past one adds are made out of the
 /// card's margin.
-#[must_use]
-pub fn prompt_reserve_bytes(hp: &Hparams, spec: &ModelSpec, rows: usize) -> u64 {
+pub fn prompt_reserve_bytes(
+    hp: &Hparams,
+    spec: &ModelSpec,
+    model: &ModelTensors,
+    rows: usize,
+) -> Result<u64, PlacementError> {
     let (embd, r) = (hp.n_embd, rows);
     let (mut heads, mut kv_heads, mut head) = (hp.n_head, 0, hp.head_dim);
     let (mut k_heads, mut v_heads, mut d) = (0, 0, 0);
@@ -124,13 +129,21 @@ pub fn prompt_reserve_bytes(hp: &Hparams, spec: &ModelSpec, rows: usize) -> u64 
     let wide: usize = others.iter().map(|&k| wide_bytes(r, k)).sum::<usize>()
         + 2 * wide_bytes(r, embd)
         + wide_bytes(r, shared_ff);
-    let card_leg = workstation::tier_chunk_scratch_bytes(
-        embd as u64,
-        experts.ff as u64,
-        experts.n_used as u64,
-        r as u64,
-    ) as usize;
-    (4 * f32s + acts + wide + 2 * route_bytes(r) + card_leg) as u64
+    let downs = leg_down_forms(Program::Solar2Body, model);
+    let card_leg = workstation::TierLegScratch {
+        n_embd: embd as u64,
+        ff: experts.ff as u64,
+        n_used: experts.n_used as u64,
+        chunk: r as u64,
+        downs,
+    }
+    .bytes(downs)?;
+    ((4 * f32s + acts + wide + 2 * route_bytes(r)) as u64)
+        .checked_add(card_leg)
+        .ok_or_else(|| PlacementError::Metadata {
+            key: "solar2 prompt reserve".into(),
+            detail: "bytes overflow u64".into(),
+        })
 }
 
 impl PlanInputs {
@@ -147,7 +160,7 @@ impl PlanInputs {
         let model = roles::classify(split, &hp)?;
         // No parser is declared: see `spec`.
         let spec = spec::spec_of(&hp, chat_of(split, None, None)?)?;
-        let reserve = prompt_reserve_bytes(&hp, &spec, PROMPT_ROWS);
+        let reserve = prompt_reserve_bytes(&hp, &spec, &model, PROMPT_ROWS)?;
         let tier = tier_places_bytes(PROMPT_ROWS, hp.experts.n_used);
         Ok(PlanInputs::new(ENGINE, hp, model, spec)?
             .with_prompt_reserve(reserve)
@@ -163,8 +176,8 @@ mod tests {
 
     use super::super::hparams::tests::{LAYERS, keys, tensors};
     use super::{PROMPT_ROWS, PlaceError, PlanInputs, prompt_reserve_bytes, tier_batch};
-    use crate::arch::synthetic::{V, header_shaped};
-    use crate::placement::{Device, PlacementError, PlanLevers, Violation, workstation};
+    use crate::arch::synthetic::{Ty, V, header_shaped, header_typed};
+    use crate::placement::{Device, PlacementError, PlanLevers, workstation};
 
     /// The small header's file, described; each test names its own file (the tests run in
     /// threads of one process).
@@ -247,7 +260,7 @@ mod tests {
     #[test]
     fn a_tier_card_is_planned_with_the_batch_places_beside_the_reserve() {
         let inputs = described("so2-place-tier");
-        let tiered = workstation::plan_bp(LAYERS, None, tier_batch(&inputs.hp));
+        let tiered = workstation::plan_bp(LAYERS, None, tier_batch(&inputs).expect("tier bytes"));
         let plain = workstation::plan_gate(LAYERS);
         let places = 12 * 512 * inputs.hp.experts.n_used as u64;
         assert_eq!(inputs.tier_reserve, Some(places));
@@ -305,51 +318,118 @@ mod tests {
     /// expert. Mutant: the reserve left out of the plan's call (the card plans, and its load stops
     /// at the allocation).
     #[test]
-    fn a_card_short_of_the_prompt_reserve_is_refused_by_name() {
-        let inputs = described("so2-place-reserve");
-        let reserve = prompt_reserve_bytes(&inputs.hp, &inputs.spec, PROMPT_ROWS);
-        assert!(reserve > 0, "the synthetic header's batch has bytes");
-        assert_eq!(inputs.prompt_reserve, reserve, "describe keeps the figure");
+    fn a_host_only_mixture_keeps_the_exact_prompt_reserve_boundary() {
+        let mut kv = keys();
+        for (key, value) in &mut kv {
+            if matches!(*key, "embedding_length" | "expert_feed_forward_length") {
+                *value = V::U32(256);
+            }
+        }
+        let mut ts = tensors();
+        for (name, dims) in &mut ts {
+            let tail = name.rsplit('.').nth(1).unwrap_or("");
+            if matches!(
+                tail,
+                "ffn_gate_exps"
+                    | "ffn_up_exps"
+                    | "ffn_down_exps"
+                    | "ffn_gate_shexp"
+                    | "ffn_up_shexp"
+                    | "ffn_down_shexp"
+            ) {
+                dims[0] = 256;
+                dims[1] = 256;
+            } else if tail == "attn_output" {
+                dims[1] = 256;
+            } else if matches!(
+                tail,
+                "token_embd"
+                    | "output"
+                    | "output_norm"
+                    | "attn_norm"
+                    | "ffn_norm"
+                    | "attn_q"
+                    | "attn_k"
+                    | "attn_v"
+                    | "attn_gate"
+                    | "ssm_f_a"
+                    | "ssm_g_a"
+                    | "ssm_beta"
+                    | "ffn_gate_inp"
+            ) {
+                dims[0] = 256;
+            }
+        }
+        let global = [
+            ("tokenizer.ggml.pre", V::Str("solar-open")),
+            ("tokenizer.chat_template", V::Str("{{ messages }}")),
+        ];
+        let ts: Vec<_> = ts
+            .into_iter()
+            .map(|(name, dims)| {
+                let ty = if name == "blk.0.ffn_down_exps.weight" {
+                    Ty::Q8_0
+                } else if matches!(
+                    name.rsplit('.').nth(1),
+                    Some("ffn_gate_exps" | "ffn_up_exps" | "ffn_down_exps")
+                ) {
+                    Ty::Q4K
+                } else {
+                    Ty::F32
+                };
+                (name, dims, ty)
+            })
+            .collect();
+        let path = header_typed("so2-place-mixed-reserve", "solar-open2", &kv, &global, &ts);
+        let split = Split::open(&path).expect("the mixed fixture opens");
+        let inputs = PlanInputs::describe(&split).expect("valid routed geometry");
+        std::fs::remove_file(path).expect("remove the header fixture");
+        let reserve = prompt_reserve_bytes(&inputs.hp, &inputs.spec, &inputs.model, PROMPT_ROWS)
+            .expect("prompt reserve");
+        let ample = workstation::plan_gate(LAYERS);
+        let placed = inputs
+            .plan(&ample, 64, &PlanLevers::default())
+            .expect("the mixed plan");
+        assert_eq!(
+            placed.n_l[0], 0,
+            "Q8_0 stays on the host under Solar's rule"
+        );
+        assert!(
+            placed.n_l[1..].iter().all(|&n| n > 0),
+            "other layers remain card candidates"
+        );
         let levers = PlanLevers::default();
         let mut machine = workstation::plan_gate(LAYERS);
-        machine.cards[0].usable_bytes = machine.cards[0].margin_bytes;
-        let short = loop {
-            match inputs.plan(&machine, 64, &levers) {
-                Err(PlaceError::Broken(v)) => {
-                    let over = v
-                        .iter()
-                        .find_map(|v| match v {
-                            Violation::CardOver { total, limit, .. } => Some(total - limit),
-                            _ => None,
-                        })
-                        .unwrap_or_else(|| panic!("{v:?}, no card over its limit"));
-                    machine.cards[0].usable_bytes += over;
-                }
-                Err(PlaceError::PromptOver {
-                    reserve: got,
-                    left,
-                    short,
-                    ..
-                }) => {
-                    assert_eq!((got, short), (reserve, reserve - left));
-                    break short;
-                }
-                other => panic!("{other:?}, not the reserve's refusal"),
-            }
-        };
-        machine.cards[0].usable_bytes += short - 1;
-        assert!(matches!(
-            inputs.plan(&machine, 64, &levers),
-            Err(PlaceError::PromptOver { short: 1, .. })
-        ));
+        // Rounded dense padding may hold experts for no extra card bytes.
+        // Byte granules isolate the reserve's exact no-expert-room boundary.
+        machine.cards[0].granule_bytes = std::num::NonZeroU64::MIN;
+        let host_only = crate::placement::plan_host_routed(
+            &inputs.model,
+            &machine,
+            64,
+            &inputs.seq_terms().slots_of(1),
+            &levers,
+        )
+        .expect("the host-only reference plans");
+        let dense = crate::arch::place_hybrid::card_terms(&host_only.cards[0]);
+        machine.cards[0].usable_bytes = machine.cards[0].margin_bytes + dense + reserve - 1;
+        match inputs.plan(&machine, 64, &levers) {
+            Err(PlaceError::PromptOver {
+                reserve: got,
+                left,
+                short,
+                ..
+            }) => assert_eq!((got, left, short), (reserve, reserve - 1, 1)),
+            other => panic!("{other:?}, not the reserve's one-byte refusal"),
+        }
         machine.cards[0].usable_bytes += 1;
         let plan = inputs
             .plan(&machine, 64, &levers)
             .expect("the card holds the terms and the reserve");
-        assert_eq!(
-            plan.n_l.iter().sum::<u64>(),
-            0,
-            "no room is left for an expert"
+        assert!(plan.violations().is_empty());
+        assert!(
+            plan.n_l.iter().all(|&n| n == 0),
+            "the exact dense-and-prompt budget leaves no expert room"
         );
     }
 }

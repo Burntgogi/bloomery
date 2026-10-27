@@ -22,7 +22,7 @@ use gguf::Split;
 use model::arch::models::{Act as SpecAct, LayerSpec, Moe};
 use model::moe::HostLayer;
 use model::placement::ModelTensors;
-use model::placement::accepts::{self, LegArms};
+use model::placement::accepts::Program;
 use model::r8file::R8Source;
 
 use crate::fault::{FaultSink, FaultSite};
@@ -51,14 +51,6 @@ const _: () = assert!(model::arch::qwen35moe::place::LEG_TIER_CHUNK == LEG_CHUNK
 /// Threads per block of both join entries.
 const THREADS: u32 = 256;
 
-/// A gate or up stack the placed leg does not run.
-const GATE_UP: &str = "a resident routed gate or up stack of a type the placed leg runs \
-                       (`accepts::prompt_leg_gate_up`)";
-
-/// A down stack the placed leg does not run.
-const DOWN: &str =
-    "a resident routed down stack of a type the placed leg runs (`accepts::prompt_leg_down`)";
-
 /// The routed activation the tier runs: `silu(g)·u`. A clamped SwiGLU, and
 /// any other activation, is refused by name.
 fn qwen_act(moe: &Moe) -> Result<Act, GpuError> {
@@ -76,19 +68,6 @@ fn qwen_act(moe: &Moe) -> Result<Act, GpuError> {
             ),
         )),
     }
-}
-
-/// The placed leg's arms ([`accepts::leg_arms`] of [`accepts::Program::Qwen3moeBody`]).
-///
-/// # Panics
-///
-/// When that program names no card-leg arms.
-fn qwen_arms() -> (LegArms, (&'static str, &'static str)) {
-    let arms = match accepts::leg_arms(accepts::Program::Qwen3moeBody) {
-        Some(arms) => arms,
-        None => panic!("{WHAT}: Program::Qwen3moeBody names no card-leg arms"),
-    };
-    (arms, (GATE_UP, DOWN))
 }
 
 /// The host views of the routed layers `run`, the refusal naming the run as
@@ -154,6 +133,7 @@ impl LegFamily for Qwen3 {
             n_used: e.n_used,
             n_embd: inputs.hp.n_embd,
             ff: e.ff,
+            program: Program::Qwen3moeBody,
         }
     }
 
@@ -173,10 +153,6 @@ impl LegFamily for Qwen3 {
 
     fn tier_act(moe: &Moe) -> Result<Act, GpuError> {
         qwen_act(moe)
-    }
-
-    fn tier_arms() -> Option<(LegArms, (&'static str, &'static str))> {
-        Some(qwen_arms())
     }
 }
 
@@ -215,6 +191,7 @@ impl LegFamily for Qwen35 {
             n_used: moe.top_k as usize,
             n_embd: inputs.spec.hidden as usize,
             ff: moe.expert_ff as usize,
+            program: Program::Qwen35Body,
         }
     }
 
@@ -234,10 +211,6 @@ impl LegFamily for Qwen35 {
 
     fn tier_act(moe: &Moe) -> Result<Act, GpuError> {
         qwen_act(moe)
-    }
-
-    fn tier_arms() -> Option<(LegArms, (&'static str, &'static str))> {
-        Some(qwen_arms())
     }
 }
 

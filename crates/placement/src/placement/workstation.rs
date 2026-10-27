@@ -19,7 +19,9 @@ use super::nodes::{Fabric, Nodes};
 use super::{
     Card, Device, Host, HostTotals, Machine, Node, PlacementError, Plan, Reserve, UnifiedPool,
 };
-use crate::kernels::{DownAct, DownForms, leg_bytes, q8_act_bytes};
+use crate::kernels::{
+    DownAct, DownForms, leg_bytes, q8_act_bytes, try_leg_bytes, try_q8_act_bytes,
+};
 
 pub const MIB: u64 = 1 << 20;
 
@@ -182,6 +184,7 @@ pub fn model_v41() -> String {
 fn card(spec: CardSpec, layers: Range<usize>, head: bool) -> Card {
     Card {
         name: spec.name.to_string(),
+        tier_leg: None,
         device: spec.device,
         usable_bytes: spec.usable_bytes(),
         context_bytes: CONTEXT,
@@ -210,6 +213,7 @@ pub fn tier_card(spec: CardSpec, batch: TierBatchBytes) -> Card {
             .card()
             .unwrap_or_else(|error| panic!("tier batch card reserve: {error}")),
     ));
+    tier.tier_leg = batch.leg;
     tier
 }
 
@@ -373,6 +377,7 @@ pub const NO_TIER_BATCH: TierBatchBytes = TierBatchBytes {
     staging: 0,
     scratch: 0,
     host: 0,
+    leg: None,
 };
 
 /// What the expert tier's prompt-batch service is called as a reserve: on
@@ -401,17 +406,63 @@ pub struct TierBatchBytes {
     pub staging: u64,
     pub scratch: u64,
     pub host: u64,
+    /// A common leg's candidate-dependent scratch; `scratch` is its bound.
+    pub leg: Option<TierLegScratch>,
 }
 
 impl TierBatchBytes {
-    /// The tier card's part; refuses a sum past u64.
+    /// The tier card's part; refuses an invalid leg bound or a sum past u64.
     pub fn card(&self) -> Result<u64, PlacementError> {
+        if let Some(leg) = self.leg
+            && leg.bytes(leg.downs)? != self.scratch
+        {
+            return Err(PlacementError::Metadata {
+                key: "tier leg batch".into(),
+                detail: "scratch reserve differs from the descriptor's bound".into(),
+            });
+        }
         self.staging
             .checked_add(self.scratch)
             .ok_or(PlacementError::TierBatchCard {
                 staging: self.staging,
                 scratch: self.scratch,
             })
+    }
+}
+
+/// The common leg's scratch geometry and the descriptor's admitted forms.
+/// Placement prices its candidate's selected forms jointly with expert rows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TierLegScratch {
+    pub n_embd: u64,
+    pub ff: u64,
+    pub n_used: u64,
+    pub chunk: u64,
+    pub downs: DownForms,
+}
+
+impl TierLegScratch {
+    /// Scratch for exactly these selected forms, refusing invalid geometry
+    /// and arithmetic overflow before an allocation or placement candidate.
+    pub fn bytes(self, downs: DownForms) -> Result<u64, PlacementError> {
+        let invalid = || PlacementError::Metadata {
+            key: "tier leg scratch".into(),
+            detail: format!("invalid or overflowing geometry: {self:?}, selected {downs:?}"),
+        };
+        if self.chunk == 0
+            || self.n_used == 0
+            || self.ff == 0
+            || self.n_embd == 0
+            || [
+                crate::kernels::DownAct::Q8Act,
+                crate::kernels::DownAct::Q8Blocks32,
+            ]
+            .into_iter()
+            .any(|act| downs.holds(act) && !self.downs.holds(act))
+        {
+            return Err(invalid());
+        }
+        try_leg_bytes(self.chunk, self.n_used, self.n_embd, self.ff, downs).ok_or_else(invalid)
     }
 }
 
@@ -425,8 +476,38 @@ const TILE_COLS: u64 = 8;
 /// activations, the tier places, their q8_1 form, the down outputs by slot.
 #[must_use]
 pub const fn tier_batch_staging_bytes(n_embd: u64, n_used: u64, cols: u64) -> u64 {
-    let slots = cols * n_used;
-    4 * cols * n_embd + 4 * slots + q8_act_bytes(cols, n_embd) + 4 * slots * n_embd
+    match try_tier_batch_staging_bytes(n_embd, n_used, cols) {
+        Some(bytes) => bytes,
+        None => panic!("tier_batch_staging_bytes: staging bytes overflow u64"),
+    }
+}
+
+const fn try_tier_batch_staging_bytes(n_embd: u64, n_used: u64, cols: u64) -> Option<u64> {
+    let Some(slots) = cols.checked_mul(n_used) else {
+        return None;
+    };
+    let Some(places) = 4u64.checked_mul(slots) else {
+        return None;
+    };
+    let Some(down) = places.checked_mul(n_embd) else {
+        return None;
+    };
+    let Some(rows) = 4u64.checked_mul(cols) else {
+        return None;
+    };
+    let Some(rows) = rows.checked_mul(n_embd) else {
+        return None;
+    };
+    let Some(bytes) = rows.checked_add(places) else {
+        return None;
+    };
+    let Some(q8) = try_q8_act_bytes(cols, n_embd) else {
+        return None;
+    };
+    let Some(bytes) = bytes.checked_add(q8) else {
+        return None;
+    };
+    bytes.checked_add(down)
 }
 
 /// The tile path's scratch for blocks of up to `slots` slots of rows of
@@ -474,9 +555,9 @@ pub const fn walk_a_tile_scratch_bytes(n_embd: u64, ff: u64, n_used: u64, cols: 
 
 /// The tier's chunk scratch for blocks of rows of `n_embd`, `n_used` slots a
 /// token, through experts of `ff`, cut in chunks of `chunk` tokens: one run of
-/// the card leg's buffers (`bloomery_gpu::card_leg::LegBufs`, the GLM-5.3-Flash
-/// tier) with its slots' columns in the 128-value q8_1 form the tier's downs
-/// read ([`leg_bytes`]), in place of the tile path's scratch.
+/// the card leg's buffers (`bloomery_gpu::card_leg::LegBufs`) with its slots'
+/// columns in the 128-value form ([`leg_bytes`]), in place of the tile path's
+/// scratch. Selected-form callers use [`try_tier_leg_batch_bytes_of`].
 #[must_use]
 pub const fn tier_chunk_scratch_bytes(n_embd: u64, ff: u64, n_used: u64, chunk: u64) -> u64 {
     leg_bytes(chunk, n_used, n_embd, ff, DownForms::of(DownAct::Q8Act))
@@ -486,8 +567,26 @@ pub const fn tier_chunk_scratch_bytes(n_embd: u64, ff: u64, n_used: u64, chunk: 
 /// rows the tier hands back and the places it reads.
 #[must_use]
 pub const fn tier_batch_host_bytes(n_embd: u64, n_used: u64, cols: u64) -> u64 {
-    let slots = cols * n_used;
-    2 * (4 * slots * n_embd + 4 * slots)
+    match try_tier_batch_host_bytes(n_embd, n_used, cols) {
+        Some(bytes) => bytes,
+        None => panic!("tier_batch_host_bytes: host bytes overflow u64"),
+    }
+}
+
+const fn try_tier_batch_host_bytes(n_embd: u64, n_used: u64, cols: u64) -> Option<u64> {
+    let Some(slots) = cols.checked_mul(n_used) else {
+        return None;
+    };
+    let Some(places) = 4u64.checked_mul(slots) else {
+        return None;
+    };
+    let Some(down) = places.checked_mul(n_embd) else {
+        return None;
+    };
+    let Some(rows_and_places) = down.checked_add(places) else {
+        return None;
+    };
+    2u64.checked_mul(rows_and_places)
 }
 
 /// The expert tier's prompt-batch bytes for blocks of up to `cols` tokens of
@@ -498,22 +597,21 @@ pub const fn tier_batch_bytes(n_embd: u64, ff: u64, n_used: u64, cols: u64) -> T
         staging: tier_batch_staging_bytes(n_embd, n_used, cols),
         scratch: tier_block_scratch_bytes(n_embd, ff, cols * n_used),
         host: tier_batch_host_bytes(n_embd, n_used, cols),
+        leg: None,
     }
 }
 
-/// [`tier_batch_bytes`] for a tier on the common card leg (`bloomery_gpu::host::leg_tier`): the
-/// scratch is one run of the leg's buffers for `chunk` tokens ([`tier_chunk_scratch_bytes`]), in
-/// place of the tile path's. The one formula of those bytes for every family whose tier is the card
-/// leg; a family names its own `chunk` and widths.
-#[must_use]
-pub const fn tier_leg_batch_bytes(
+/// [`tier_batch_bytes`] for a candidate-selected common leg in the 128-value form.
+///
+/// Refuses invalid geometry or overflowing byte counts before placement.
+pub fn tier_leg_batch_bytes(
     n_embd: u64,
     ff: u64,
     n_used: u64,
     chunk: u64,
     cols: u64,
-) -> TierBatchBytes {
-    tier_leg_batch_bytes_of(
+) -> Result<TierBatchBytes, PlacementError> {
+    try_tier_leg_batch_bytes_of(
         n_embd,
         ff,
         n_used,
@@ -522,22 +620,42 @@ pub const fn tier_leg_batch_bytes(
     )
 }
 
-/// [`tier_leg_batch_bytes`] for a tier whose layers' downs read the forms `downs`: the leg's
-/// buffers hold the slots' columns in each of them (`bloomery_gpu::card_leg::LegBufs::for_downs`,
-/// [`leg_bytes`]), as an NVFP4 down's 32-value blocks.
-#[must_use]
-pub const fn tier_leg_batch_bytes_of(
+/// The common leg's staging, host rows and selected-form scratch, refusing
+/// invalid geometry or overflowing byte counts before placement.
+pub fn try_tier_leg_batch_bytes_of(
     n_embd: u64,
     ff: u64,
     n_used: u64,
     (chunk, cols): (u64, u64),
     downs: DownForms,
-) -> TierBatchBytes {
-    TierBatchBytes {
-        staging: tier_batch_staging_bytes(n_embd, n_used, cols),
-        scratch: leg_bytes(chunk, n_used, n_embd, ff, downs),
-        host: tier_batch_host_bytes(n_embd, n_used, cols),
-    }
+) -> Result<TierBatchBytes, PlacementError> {
+    let leg = TierLegScratch {
+        n_embd,
+        ff,
+        n_used,
+        chunk,
+        downs,
+    };
+    let scratch = leg.bytes(downs)?;
+    let counted = || -> Option<(u64, u64)> {
+        if cols == 0 {
+            return None;
+        }
+        Some((
+            try_tier_batch_staging_bytes(n_embd, n_used, cols)?,
+            try_tier_batch_host_bytes(n_embd, n_used, cols)?,
+        ))
+    };
+    let (staging, host) = counted().ok_or_else(|| PlacementError::Metadata {
+        key: "tier leg batch".into(),
+        detail: format!("invalid or overflowing staging: {leg:?}, columns {cols}"),
+    })?;
+    Ok(TierBatchBytes {
+        staging,
+        scratch,
+        host,
+        leg: Some(leg),
+    })
 }
 
 /// Plan (b′): the A6000 runs all `layers` and the head as in [`plan_a`];
@@ -629,6 +747,7 @@ pub fn plan_node_tiers(
         remote.cards[0]
             .reserves
             .extend(tier_card(spec, batch).reserves);
+        remote.cards[0].tier_leg = batch.leg;
         machines.push(remote);
     }
     Ok(machines)
@@ -811,6 +930,7 @@ pub(crate) fn spark_nodes(n: usize, layers: usize, fabric: Fabric) -> Nodes {
         staging: 0,
         scratch: 0,
         host: 0,
+        leg: None,
     };
     let mut machines = plan_node_tiers(layers, spec, &vec![spec; n - 1], batch)
         .expect("synthetic nodes with no batch bytes");
@@ -1701,6 +1821,7 @@ mod tests {
                 staging: 1,
                 scratch: 2,
                 host: 3,
+                leg: None,
             },
         ];
         for layers in [0, 1, 20, 43, 47, 48, 61, 78] {
@@ -1856,6 +1977,7 @@ mod tests {
             staging: u64::MAX,
             scratch: 1,
             host: 0,
+            leg: None,
         };
         for result in [
             plan_tiers(4, A6000, &[RTX_3090], None, huge).map(|_| ()),
@@ -1906,6 +2028,7 @@ mod tests {
             staging: 10,
             scratch: 5,
             host: 100,
+            leg: None,
         };
         let machines = plan_node_tiers(4, specs[0], &specs[1..], batch)
             .expect("four nodes of the same card name and ordinal");
@@ -1950,6 +2073,7 @@ mod tests {
             staging: 0,
             scratch: 0,
             host: u64::MAX / 2,
+            leg: None,
         };
         let remotes = [gb10(80 << 30), gb10(60 << 30)];
         let machines =
@@ -1985,6 +2109,7 @@ mod tests {
             staging: 10,
             scratch: 5,
             host: 100,
+            leg: None,
         };
         let m = plan_tiers(4, A6000, &[t1, t2], None, batch).expect("two tiers");
         let rows: Vec<&(String, u64)> = m
@@ -2065,6 +2190,7 @@ mod tests {
             assert_eq!(counted_arena_bytes(&m.cards[0]), 7, "{}", spec.name);
             let want = Card {
                 name: spec.name.to_string(),
+                tier_leg: None,
                 device: spec.device,
                 usable_bytes: spec.usable_bytes(),
                 context_bytes: CONTEXT,
@@ -2112,6 +2238,7 @@ mod tests {
                 staging: u64::MAX,
                 scratch: 1,
                 host: 0,
+                leg: None,
             },
         );
     }
@@ -2131,6 +2258,7 @@ mod tests {
             staging: u64::MAX - 1,
             scratch: 1,
             host: 0,
+            leg: None,
         };
         assert_eq!(edge.card().expect("the sum fits u64"), u64::MAX);
         assert!(matches!(

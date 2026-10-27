@@ -41,12 +41,12 @@ use std::mem::ManuallyDrop;
 
 use cuda_core::{CudaStream, DeviceBuffer};
 use model::arch::models::{Ffn, LayerSpec};
-
 use model::arch::place_hybrid::RingForms;
+use model::placement::accepts::{self, LegArms, Program};
 use model::placement::kernels::{self, DownAct, DownForms};
 
 use crate::card_leg::{
-    self, CardLeg, LegBufs, LegRun, LegShape, LegStacks, LegSum, RouteBlock, RouteW,
+    self, CardLeg, LegBufs, LegRun, LegShape, LegStacks, LegSum, RouteBlock, RouteW, STACK_ROLES,
 };
 use crate::card_slots::{CardSlotKernels, Places};
 use crate::gemm::Gemm32Kernels;
@@ -68,6 +68,8 @@ pub struct CardFamily {
     pub n_used: usize,
     /// Layer `l`'s gate, up and down stacks' names.
     pub stacks: fn(usize) -> [String; 3],
+    /// The program whose selected gate·up and down launches run the stacks.
+    pub program: Program,
 }
 
 /// The kernels a run launches: the card leg's (its sum stage included), and
@@ -75,6 +77,7 @@ pub struct CardFamily {
 struct CardKernels {
     leg: CardLeg,
     places: CardSlotKernels,
+    arms: LegArms,
 }
 
 impl CardFamily {
@@ -266,8 +269,7 @@ pub struct CardExperts {
     ff: usize,
     /// The model's width.
     n: usize,
-    /// The forms the card layers' downs read, which every run's buffers hold
-    /// ([`card_downs`]).
+    /// The union of the resident layers' selected down activation forms.
     downs: DownForms,
     /// The one-token step's buffers.
     step: CardBufs,
@@ -322,6 +324,10 @@ impl CardExperts {
         tiers: bool,
     ) -> Result<CardExperts, GpuError> {
         let what = family.what;
+        let arms = accepts::leg_arms(family.program).ok_or(GpuError::state(
+            what,
+            "the selected program's card leg arms",
+        ))?;
         let mut per = Vec::with_capacity(layers.len());
         let mut tier_k = Vec::with_capacity(layers.len());
         let mut downs = DownForms::NONE;
@@ -362,7 +368,7 @@ impl CardExperts {
                 per.push(None);
                 continue;
             }
-            let stacks = LegStacks::of(w, layer.names())?;
+            let stacks = LegStacks::of_arms(w, layer.names(), arms, STACK_ROLES)?;
             stacks.check(n_card, family.shape(n, ff, 1))?;
             downs = downs.with(down_act(what, &layer, stacks.down_ty())?);
             per.push(Some(layer));
@@ -373,6 +379,7 @@ impl CardExperts {
             k: CardKernels {
                 leg: CardLeg::load(gpu)?,
                 places: CardSlotKernels::load(gpu.context())?,
+                arms,
             },
             layers: per,
             tier: tier_k,
@@ -714,7 +721,7 @@ impl CardExperts {
                 sel,
             )
         };
-        let stacks = LegStacks::of(w, layer.names())?;
+        let stacks = LegStacks::of_arms(w, layer.names(), self.k.arms, STACK_ROLES)?;
         places(map.buf(), row_off, &mut *sel)?;
         let card = LegRun {
             layer: l,
@@ -804,7 +811,7 @@ impl CardKernels {
         io: &Io<'_>,
         sel: &DeviceBuffer<u32>,
     ) -> Result<(), GpuError> {
-        let stacks = LegStacks::of(w, layer.names())?;
+        let stacks = LegStacks::of_arms(w, layer.names(), self.arms, STACK_ROLES)?;
         let run = LegRun {
             layer: l,
             stacks: &stacks,
@@ -830,7 +837,415 @@ impl CardKernels {
 
 #[cfg(test)]
 mod tests {
-    use super::{DownAct, DownForms, card_downs};
+    use super::*;
+    use gguf::GgmlType;
+    use gguf::write::{Layout, TensorDecl, Writer};
+    use model::arch::models::{self, Mixer, Moe, Residual, Router, RouterNorm, Score};
+    use model::placement::{
+        Device, ExpertList, ExpertPart, Format, ModelTensor, ModelTensors, Role, RoutedRule, Row,
+        Segment,
+    };
+
+    use crate::card_leg::tests::stack_bytes;
+    use crate::host::leg_tier::LegTier;
+    use crate::host::tier::{TierBlock, TierExperts, TierInput, TierIo, TierSet};
+    use crate::hybrid::HOST;
+
+    const N: usize = 256;
+    const FF: usize = 256;
+    const USED: usize = 8;
+    const EXPERTS: usize = 16;
+    const CARD: usize = 4;
+    const CAP: usize = 3;
+    const FAMILY: CardFamily = CardFamily {
+        what: "mixed card wrapper",
+        n_expert: EXPERTS,
+        n_used: USED,
+        stacks: model::arch::names::routed_stacks,
+        program: Program::Qwen35Body,
+    };
+
+    fn layers(n: usize) -> Vec<LayerSpec> {
+        vec![
+            LayerSpec {
+                mixer: Mixer::None,
+                ffn: Ffn::Moe(Moe {
+                    experts: EXPERTS as u32,
+                    top_k: USED as u32,
+                    expert_ff: FF as u32,
+                    latent: None,
+                    pre_exp_norm: false,
+                    post_exp_norm: None,
+                    act: models::Act::SwiGlu { limit: None },
+                    router: Router {
+                        score: Score::Sigmoid,
+                        bias: false,
+                        norm: RouterNorm::SelectedSum,
+                        scale: 1.0,
+                        hash: false,
+                    },
+                    shared: None,
+                }),
+                residual: Residual::Plain,
+                extras: Vec::new(),
+            };
+            n
+        ]
+    }
+
+    fn tier_act(moe: &Moe) -> Result<Act, GpuError> {
+        Ok(Act::SwigluClamp {
+            limit: moe.act.swiglu_limit(),
+        })
+    }
+
+    fn weights(gpu: &Gpu, triples: &[[GgmlType; 3]]) -> Weights {
+        let mut decls = Vec::new();
+        let mut data = Vec::new();
+        let mut tensors = Vec::new();
+        for (l, triple) in triples.iter().enumerate() {
+            for (part, (name, &ty)) in (FAMILY.stacks)(l).into_iter().zip(triple).enumerate() {
+                let (rows, k) = if part == 2 { (N, FF) } else { (FF, N) };
+                let bytes = stack_bytes(ty, CARD * rows, k, 7 + (3 * l + part) as u64);
+                tensors.push(ModelTensor {
+                    name: name.clone(),
+                    shard: 0,
+                    layer: Some(l),
+                    role: Role::RoutedExperts,
+                    ty,
+                    dims: vec![k as u64, rows as u64, CARD as u64],
+                    file_bytes: bytes.len() as u64,
+                    gathered_rows: None,
+                });
+                decls.push(TensorDecl {
+                    name,
+                    dims: vec![k as u64, rows as u64, CARD as u64],
+                    type_id: ty.as_u32(),
+                    nbytes: bytes.len() as u64,
+                });
+                data.push(bytes);
+            }
+        }
+        static CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let call = CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "bloomery-mixed-wrappers-{}-{call}.gguf",
+            std::process::id()
+        ));
+        let layout = Layout::new(&[], decls.clone()).expect("a layout");
+        let file = std::io::BufWriter::new(std::fs::File::create(&path).expect("a file"));
+        let mut writer = Writer::new(file, layout).expect("a writer");
+        for (decl, bytes) in decls.iter().zip(data) {
+            writer.tensor(&decl.name, &bytes).expect("a tensor");
+        }
+        writer.finish().expect("a finished file");
+        let file = gguf::Split::open(&path).expect("the file");
+        // IQ3_S has a selected expert row arm, not a generic device format.
+        let model = ModelTensors {
+            tensors,
+            layers: triples.len(),
+            experts: EXPERTS as u64,
+            experts_used: USED as u64,
+            bf16_words: |_| false,
+        };
+        let RoutedRule::Leg { gate_up, down, .. } = accepts::routed_rule(FAMILY.program) else {
+            panic!("the fixture family must select a card leg");
+        };
+        let rows = model
+            .tensors
+            .iter()
+            .enumerate()
+            .map(|(i, t)| {
+                let format = match ExpertPart::of_name(&t.name).expect("a routed part") {
+                    ExpertPart::Gate | ExpertPart::Up => gate_up(t.ty),
+                    ExpertPart::Down => down(t.ty),
+                }
+                .expect("the selected arm's format");
+                let mut segment = Segment {
+                    device: Device::Card(0),
+                    format: Format::Card(format),
+                    experts: Some(ExpertList::prefix(CARD as u64).expect("the card prefix")),
+                    resident_bytes: 0,
+                };
+                segment.resident_bytes = segment
+                    .buffer_bytes(t, model.experts_of(t))
+                    .expect("the selected format's buffers")
+                    .into_iter()
+                    .sum();
+                Row {
+                    tensor: i,
+                    segments: vec![segment],
+                    read_bytes: t.file_bytes,
+                    stage: 0,
+                }
+            })
+            .collect::<Vec<_>>();
+        let weights = Weights::load_rows(gpu.stream(), &file, &model, &rows, 0)
+            .expect("resident expert stacks");
+        std::fs::remove_file(path).expect("remove the fixture");
+        weights
+    }
+
+    fn assert_bits(got: &[f32], want: &[f32]) {
+        assert_eq!(got.len(), want.len());
+        for (i, (&g, &w)) in got.iter().zip(want).enumerate() {
+            assert!(g.is_finite() && w.is_finite(), "lane {i}: {g} vs {w}");
+            assert_eq!(g.to_bits(), w.to_bits(), "lane {i}: {g} vs {w}");
+        }
+    }
+
+    /// Each real wrapper uses its resident layers' union, not a model-wide
+    /// quant: both one-form loads and mixed loads conserve bytes and execute
+    /// step, pass, batch and tier chunks as the same common leg. Host slots
+    /// stay untouched on the tier, including a chunk's short final run.
+    #[test]
+    #[ignore = "needs a CUDA device; `just gate-gpu-lib` runs it on the box"]
+    fn hw_mixed_card_and_tier_wrappers_conserve_forms_and_rows() {
+        use GgmlType::{IQ3_S, IQ4_XS, Q5_K, Q6_K, Q8_0};
+        let gpu = Gpu::with_device(0).expect("a Gpu on device 0");
+        let stream = gpu.stream();
+        let leg = CardLeg::load(&gpu).expect("the reference leg");
+        for triples in [
+            vec![[IQ3_S, IQ3_S, Q5_K], [IQ4_XS; 3]],
+            vec![[Q5_K, Q5_K, Q8_0]],
+            vec![[Q5_K, Q5_K, Q6_K]],
+            vec![
+                [IQ3_S, IQ3_S, Q5_K],
+                [Q5_K, Q5_K, Q8_0],
+                [Q5_K, Q5_K, Q6_K],
+                [IQ4_XS; 3],
+            ],
+        ] {
+            let w = weights(&gpu, &triples);
+            let specs = layers(triples.len());
+            let map = SlotMap::prefix(0..triples.len(), EXPERTS, CARD).expect("a map");
+            let mut card = CardExperts::new(&gpu, &w, FAMILY, &specs, &map, (N, FF), CAP)
+                .expect("the card wrapper");
+            let mut batch = card.batch(&gpu, CAP).expect("the batch");
+            assert_eq!(card.batch_bytes(CAP), batch.bytes());
+            let forms = triples.iter().fold(DownForms::NONE, |forms, tys| {
+                forms.with(kernels::down(tys[2]).expect("a down").1)
+            });
+            let counted = |cap| {
+                kernels::leg_bytes(cap as u64, USED as u64, N as u64, FF as u64, forms) as usize
+            };
+            assert_eq!(
+                card.bytes(),
+                counted(1) + counted(CAP) + 2 * size_of::<f32>() * (1 + CAP) * N,
+            );
+            assert_eq!(
+                batch.bytes(),
+                counted(CAP) + 2 * size_of::<f32>() * CAP * N + size_of::<u32>() * CAP * USED,
+            );
+            let shape = FAMILY.shape(N, FF, 2);
+            let set = TierSet::new(
+                0..triples.len(),
+                EXPERTS,
+                vec![(0..CARD as u32).collect(); triples.len()],
+            )
+            .expect("the tier set");
+            let mut tier = LegTier::new(&gpu, &specs, &set, &w, shape, FAMILY.program, tier_act)
+                .expect("the tier wrapper");
+            assert_eq!(tier.block_bytes(), counted(shape.cap));
+            let host_x: Vec<f32> = (0..CAP * N).map(|i| (i % 71) as f32 / 71.0 - 0.5).collect();
+            let x = DeviceBuffer::from_host(stream, &host_x).expect("the rows");
+            let base: Vec<f32> = (0..CAP * N).map(|i| (i % 13) as f32 * 0.125).collect();
+            let x1 = DeviceBuffer::from_host(stream, &base).expect("the base");
+            let route = DeviceBuffer::from_host(stream, &[0.125f32; CAP * USED]).expect("weights");
+            let host_sel: Vec<u32> = (0..CAP * USED)
+                .map(|i| {
+                    if i % USED == USED - 1 {
+                        HOST
+                    } else {
+                        (i % CARD) as u32
+                    }
+                })
+                .collect();
+            let sel = DeviceBuffer::from_host(stream, &host_sel).expect("the places");
+            let ids = DeviceBuffer::from_host(
+                stream,
+                &host_sel
+                    .iter()
+                    .map(|&s| if s == HOST { (EXPERTS - 1) as u32 } else { s })
+                    .collect::<Vec<_>>(),
+            )
+            .expect("the ids");
+            let places = DeviceTensor::upload(stream, &map.stage_view(), triples.len(), EXPERTS)
+                .expect("the map's card view");
+            let act = crate::Q8Act::with_tier_cols(stream, CAP, N).expect("the tier block's form");
+            for (l, tys) in triples.iter().enumerate() {
+                let names = (FAMILY.stacks)(l);
+                let stacks = LegStacks::of_arms(
+                    &w,
+                    names.each_ref().map(String::as_str),
+                    accepts::leg_arms(FAMILY.program).expect("the selected arms"),
+                    STACK_ROLES,
+                )
+                .expect("the reference stacks");
+                let mut reference = LegBufs::for_down(
+                    stream,
+                    FAMILY.shape(N, FF, CAP),
+                    kernels::down(tys[2]).expect("a down").1,
+                )
+                .expect("the reference buffers");
+                let mut acc = DeviceBuffer::zeroed(stream, CAP * N).expect("the reference sum");
+                for m in [1, CAP] {
+                    let io = Io {
+                        normed: &x,
+                        weights: &route,
+                        x1: &x1,
+                        m,
+                    };
+                    let rule = Act::SwigluClamp { limit: 0.0 };
+                    leg.enqueue(
+                        &gpu,
+                        &mut reference,
+                        &LegRun {
+                            layer: l,
+                            stacks: &stacks,
+                            normed: &x,
+                            m,
+                            sel: &sel,
+                            n_card: CARD,
+                            rule,
+                        },
+                        Some(LegSum {
+                            w: &route,
+                            acc: &mut acc,
+                        }),
+                    )
+                    .expect("the reference");
+                    let sums = acc.to_host_vec(stream).expect("the reference sums");
+                    let want: Vec<f32> = sums[..m * N]
+                        .iter()
+                        .zip(&base)
+                        .map(|(&a, &b)| a + b)
+                        .collect();
+                    let got = if m == 1 {
+                        card.enqueue_step(&gpu, &w, l, rule, &io, &sel)
+                            .expect("step");
+                        card.pre()
+                    } else {
+                        card.enqueue_pass(&gpu, &w, l, rule, &io, &sel)
+                            .expect("pass");
+                        card.pass_pre().expect("pass output")
+                    };
+                    assert_bits(&got.to_host_vec(stream).expect("output")[..m * N], &want);
+                    card.enqueue_rows(
+                        &gpu,
+                        &w,
+                        &mut batch,
+                        l,
+                        rule,
+                        &io,
+                        (&ids, &places, l * EXPERTS),
+                    )
+                    .expect("batch");
+                    assert_bits(
+                        &batch.pre().to_host_vec(stream).expect("batch output")[..m * N],
+                        &want,
+                    );
+                    let mut down =
+                        DeviceBuffer::from_host(stream, &vec![1.0e30f32; CAP * USED * N])
+                            .expect("the tier output");
+                    if m == 1 {
+                        tier.enqueue_layer(
+                            &gpu,
+                            &w,
+                            l,
+                            TierIo {
+                                act: TierInput::F32(&x),
+                                sel: &sel,
+                                rows: &mut down,
+                                cols: m,
+                            },
+                        )
+                        .expect("tier step");
+                    } else {
+                        tier.enqueue_block(
+                            &gpu,
+                            &w,
+                            l,
+                            TierBlock {
+                                x: &x,
+                                act: &act,
+                                sel: &sel,
+                                cols: m,
+                                down: &mut down,
+                            },
+                        )
+                        .expect("tier chunks");
+                    }
+                    let got = down.to_host_vec(stream).expect("tier output");
+                    let want = reference
+                        .down()
+                        .to_host_vec(stream)
+                        .expect("reference rows");
+                    for (s, &place) in host_sel[..m * USED].iter().enumerate() {
+                        if place == HOST {
+                            assert!(got[s * N..(s + 1) * N].iter().all(|&v| v == 1.0e30));
+                        } else {
+                            assert_bits(&got[s * N..(s + 1) * N], &want[s * N..(s + 1) * N]);
+                        }
+                    }
+                }
+            }
+            assert!(gpu.take_fault().expect("the fault word").is_none());
+        }
+        let set = TierSet::new(0..1, EXPERTS, vec![Vec::new()]).expect("an empty tier");
+        let shape = FAMILY.shape(N, FF, 2);
+        let idle = LegTier::new(
+            &gpu,
+            &layers(1),
+            &set,
+            &Weights::default(),
+            shape,
+            FAMILY.program,
+            tier_act,
+        )
+        .expect("a configured tier need not hold an expert");
+        assert_eq!(
+            idle.block_bytes(),
+            kernels::leg_bytes(
+                shape.cap as u64,
+                USED as u64,
+                N as u64,
+                FF as u64,
+                DownForms::NONE,
+            ) as usize,
+            "an empty tier has no down-activation allocation",
+        );
+        let triple = [IQ3_S, Q5_K, Q8_0];
+        let program = Program::Qwen35Body;
+        let w = weights(&gpu, &[triple]);
+        let specs = layers(1);
+        let map = SlotMap::prefix(0..1, EXPERTS, CARD).expect("a map");
+        let family = CardFamily { program, ..FAMILY };
+        assert!(
+            matches!(
+                CardExperts::new(&gpu, &w, family, &specs, &map, (N, FF), CAP),
+                Err(GpuError::Tensor { .. }),
+            ),
+            "{program:?}: {triple:?}"
+        );
+        let set =
+            TierSet::new(0..1, EXPERTS, vec![(0..CARD as u32).collect()]).expect("a tier set");
+        assert!(
+            matches!(
+                LegTier::new(
+                    &gpu,
+                    &specs,
+                    &set,
+                    &w,
+                    family.shape(N, FF, 2),
+                    program,
+                    tier_act,
+                ),
+                Err(GpuError::Tensor { .. }),
+            ),
+            "{program:?}: {triple:?}"
+        );
+    }
 
     /// A load's leg buffers hold the forms its card layers' downs read — the
     /// 32-value form for NVFP4's, both for a mix — and the 128-value form on a

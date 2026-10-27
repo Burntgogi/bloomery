@@ -2,8 +2,8 @@
 
 Design snapshot: **`e53cabebbb9b16249c81b7c26a026da1670f7d9d`**, requested by
 [#632](https://github.com/midagedev/bloomery/issues/632). The source-gap observations below describe
-that snapshot. This component tree has a header-only reader, shared tier-handoff work and the ordinary
-IQ4_XS shared site, but no Flint body, app session or serve seat. Primitive GPU evidence is not Flint model admission.
+that snapshot. This component tree has a header-only reader, shared tier-handoff work, the ordinary
+IQ4_XS shared site and selected common-leg work, but no Flint body, app session or serve seat. Primitive GPU evidence is not Flint model admission.
 
 ## Six-slot handoff closure checks — 2026-10-26
 
@@ -89,31 +89,6 @@ Each device slice needs its numerical/fault gates and the maintainer's offered h
 Legacy metadata booleans share `RouterNorm::from_legacy_bool`: false keeps scores and true uses the
 existing epsilon-added selected sum. Flint's distinct floor mapping stays in its reader.
 
-### Six-slot F32 tier handoff implementation
-
-`HandoffKernels::enqueue_handoff_tier` now selects a genuine six-slot F32 entry
-beside the existing four- and eight-slot entries. Both host and tier layouts must have the
-same supported slot count and activation width; compressed tier images remain
-refused. The entry uses the existing copy/place/fault helpers and the existing
-subsequent go/publication protocol; no Flint router or Program is registered.
-
-`hw_f32_tier_handoffs_conserve_consumed_routes`, owned by
-`gate-gpu-ds41-lib`, consumes the four-, six- and eight-slot handoffs' weights and emitted
-places through the production tier accumulator and adds the host sum. It covers partial
-widths, invalid ids, poisoned non-owning rows, trailing sentinels and changed replay
-weights. Its host sum is precomputed and activation images are checked by
-readback: it is not expert execution or two-card completion/publication proof.
-Earlier integrated-source results do not verify this branch after its merge with current
-main; the final-source hardware result must be recorded separately.
-
-The new `ffn_handoff_6_tier` entry needs add-class PTX/JIT/resource and
-owning-gate evidence; the four-slot, eight-slot and other existing entries must remain
-unchanged. The cc12.1 tables pin it at the cc8.6 scan's values until an observed NVIDIA JIT run.
-Actual six-slot body/tier and two-card completion remain integration work, not
-capabilities inferred from this primitive.
-`check-ptx-names` is green with those pinned rows; a GB10 scan replaces them with the
-observed spill/JIT-local measurements. Offline no-JIT scans cannot supply that column.
-
 ### Ordinary IQ4_XS shared-site implementation
 
 IQ4_XS now has an ordinary file-layout/dense entry in QROWS and a common site family.
@@ -163,6 +138,124 @@ These are source-specific historical results, not another hardware execution of
 later diagnostic, test or documentation changes. Wider affected real-model,
 placement and residency coverage remains explicit; this does not establish a
 Flint oracle, physical cc12.1, ROCm or performance.
+
+### Selected expert arms and tier scratch
+
+Common card and tier wrappers resolve `LegArms` from their selected `Program`, rather than assuming
+every family has one gate/up type or one down activation form. Their resident layers determine the
+union of `Q8Act` and `Q8Blocks32` buffers. Plane layouts remain restricted to the selected program's
+arms; Solar's host-only triples do not enlarge its card scratch.
+
+Placement charges a tier's selected down forms jointly with its expert count. The same kernels-owned,
+checked sizing arithmetic is used by allocation and planning; malformed or overflowing public scratch
+descriptors are refused by name. The plan records the selected reserve, and loaders check that amount
+instead of the machine descriptor's upper bound. No always-both allocation or reserve-equality waiver
+is used.
+
+The wrapper fixture loads each expert part through the selected program's `routed_rule` format,
+`Segment::buffer_bytes` and `Weights::load_rows`, including selected-only IQ3_S. Its mixed loads
+compare real step, pass, batch and tier allocations and rows against the common leg. A mismatched
+gate/up pair remains refused; Solar's admitted Q6_K down is not a rejection case. Tier activation
+selection remains the family's contract, independently of the program-owned stack admission.
+
+The 2026-10-26 cutover removes the obsolete always-Q8 tier-reserve regression:
+selected mixed-layer and mismatched-gate/up coverage remains in
+`tier_scratch_follows_selected_mixed_layers`, with allocation and budget boundaries
+covered by the placement and GPU wrapper consumers. The MiniMax planner test retains
+its reserve and idle-tier behavior checks rather than comparing descriptor representation
+against a different constructor.
+Host-only projections intentionally have no card totals: fixed reserves remain owned by their machine.
+Only a dynamic tier-leg descriptor requires the plan's selected card totals. The existing node paging
+budget regression exercises this distinction without a GPU, including OS reserve and constrained host room.
+
+`tier_leg_batch_bytes` and the explicit-form `try_tier_leg_batch_bytes_of` return
+`Result<TierBatchBytes, PlacementError>` and construct candidate-selected descriptors.
+An empty tier selects no down form, matching `LegTier`'s actual allocation instead of
+advertising unused Q8Act scratch. Qwen3/Qwen35, MiMo and Muse use this checked path.
+Qwen3/Qwen35 and MiniMax derive their descriptor bounds from the described model's
+admitted forms through `accepts::leg_down_forms`, as GLM5Next and Solar do.
+The Qwen public wrappers take `PlanInputs`, not geometry alone: a supported
+Q8_0, Q5_1 or IQ4_NL candidate must not fail the whole plan just because its
+32-value form remains unselected at the tier's budget boundary.
+No fallback format can admit a mismatched triple.
+The checked constructors and non-leg paths share staging and host byte formulas.
+Malformed geometry and overflow are refused rather than panicking; a dense Qwen3.6
+request for an expert tier is a named metadata refusal, not zero expert geometry.
+Separate tile/route-based fixed-reserve paths remain unchanged.
+
+The planner's selected scratch calculation has one union/byte rule. Fill prepares
+per-layer forms once for dynamic tier-leg cards, including multiple forms in one
+layer, and reuses them with its cached footprint instead of rescanning tensors for
+each candidate. Fixed-reserve cards need no selected-form cache.
+
+The Solar budget regression starts from a typed mixed GGUF description and exercises
+the planner's one-byte refusal/success boundary without overwriting its described
+prompt reserve. With byte granules (no reusable dense padding), the exact dense-and-prompt
+budget leaves no room for expert weights.
+The real mixed-wrapper hardware case also checks allocation of a configured empty tier.
+
+Historical exact-source proof at `3071a9f0d8ed4773692e0c040dece222b90f6bec`:
+GPU library418 passed plus10 held passed, verbs1 passed, and all1657 canonical entries
+identical to main15778e2c (4bins/8carriers, non-JIT rows equal).
+The repair at `c26025b1fb9fad1af399401d27cf709005736ba0` then executed the extended
+real CUDA mixed/empty-tier consumer:1 passed,0 failed,0 ignored,427 filtered,24.18s.
+Its fresh4bin/8carrier canonical comparison again found all1657entries identical to main15778e2c,
+with non-JIT rows equal. Native formatting/Clippy passed (warning3=ratchet3); model557 and
+placement202 passed,0 failed,5 model tests ignored,0 filtered.
+
+The historical component contract source `7e37ef9a6ebbd766032ee521a0ee16e25f163851`
+executed the real CUDA mixed/empty-tier consumer on RTX3090 cc8.6:1 passed,
+0 failed/ignored,427 filtered,23.98s. Its metadata-only
+`a_dense_header_plans_through_qwen35_on` frontend consumer also passed1 case,
+including the named dense-header expert-tier refusal; that is not a second GPU case.
+The review code passed native formatting/all-target Clippy (warning3=ratchet3),
+chain23, GGUF67, model557 and placement202 (five model cases ignored,0 filtered).
+An exact-source7e37ef9a canonical comparison against main15778e2c found all1657
+entries identical across4bins/8carriers and non-JIT rows equal; it did not compare
+driver-JIT resource rows. The older full-library counts above remain historical,
+not a new full-library run of the review repairs.
+
+The component subsequently merges pinned upstream `cb8d92ebddd1ce1a325a15450c06a01f57ecf88c`.
+That reconciliation retains upstream's GLM mixer-form consumers alongside this component's
+checked tier-byte API; the explicit-form API has no input-scale flag. The GPU results
+above belong to their named historical sources, not the merged source.
+
+At merged source `c38d603ca1d33c6c2bede63aba102199715fb9ef`, native formatting and
+all-target Clippy passed, as did chain23, GGUF67, model559 and placement202
+(five model cases ignored, zero failed/filtered). The actual oxide-linked
+`a_dense_header_plans_through_qwen35_on` frontend consumer passed1 case,
+0 failed/ignored,6 filtered, including the named expert-tier refusal.
+This is metadata-only host execution, not fresh NVIDIA execution of the merged source
+or a whole-model numerical result.
+
+The host-only public planner consumer covers one-byte boundaries before the first resident layer
+and before adding another down form, plus descriptor overflow refusal. These and the CUDA consumer
+are not a whole-model oracle or every affected model/residency gate; canonical equality does not
+waive changed host/allocation consumers. Flint's `Program` admission and body/app/seat remain absent.
+### Six-slot F32 tier handoff implementation
+
+`HandoffKernels::enqueue_handoff_tier` now selects a genuine six-slot F32 entry
+beside the existing four- and eight-slot entries. Both host and tier layouts must have the
+same supported slot count and activation width; compressed tier images remain
+refused. The entry uses the existing copy/place/fault helpers and the existing
+subsequent go/publication protocol; no Flint router or Program is registered.
+
+`hw_f32_tier_handoffs_conserve_consumed_routes`, owned by
+`gate-gpu-ds41-lib`, consumes the four-, six- and eight-slot handoffs' weights and emitted
+places through the production tier accumulator and adds the host sum. It covers partial
+widths, invalid ids, poisoned non-owning rows, trailing sentinels and changed replay
+weights. Its host sum is precomputed and activation images are checked by
+readback: it is not expert execution or two-card completion/publication proof.
+Earlier integrated-source results do not verify this branch after its merge with current
+main; the final-source hardware result must be recorded separately.
+
+The new `ffn_handoff_6_tier` entry needs add-class PTX/JIT/resource and
+owning-gate evidence; the four-slot, eight-slot and other existing entries must remain
+unchanged. The cc12.1 tables pin it at the cc8.6 scan's values until an observed NVIDIA JIT run.
+Actual six-slot body/tier and two-card completion remain integration work, not
+capabilities inferred from this primitive.
+`check-ptx-names` is green with those pinned rows; a GB10 scan replaces them with the
+observed spill/JIT-local measurements. Offline no-JIT scans cannot supply that column.
 
 
 
