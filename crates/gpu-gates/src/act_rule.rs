@@ -1082,6 +1082,46 @@ mod site_tests {
         assert_eq!(site_rel(GgmlType::BF16, Arm::Expert), None);
     }
 
+    /// Ours is the form the launches read, as their sources say it: the text of the kernel
+    /// table's `SiteEntry::reads` (which `site.rs`'s `SiteTy::reads` returns) and of the 32-value
+    /// GEMM family's module doc, so a launch that moves to another form is red here until the
+    /// table follows it.
+    #[test]
+    fn site_rel_reads_the_forms_the_launches_name() {
+        let gpu = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../gpu/src");
+        let read = |file: &str| {
+            std::fs::read_to_string(gpu.join(file))
+                .unwrap_or_else(|e| panic!("crates/gpu/src/{file}: {e}"))
+        };
+        let (site, gemm, grouped) = (
+            read("../../gguf/src/card.rs"),
+            read("gemm/mod.rs"),
+            read("gemm/grouped.rs"),
+        );
+        // The contract is the arm's text, not rustfmt's wrapping of its or-pattern.
+        let site = site.split_whitespace().collect::<Vec<_>>().join(" ");
+        for line in [
+            // PIN(2026-10-27): IQ4_XS reads the 128-value q8_1 form with the K-quants (`SiteEntry::Iq4xs`), as `site_rel` says.
+            "SiteEntry::Q3k | SiteEntry::Q4k | SiteEntry::Q5k | SiteEntry::Q6k | SiteEntry::Iq4xs => SiteAct::Q8x128",
+            "SiteEntry::Q8_0 => SiteAct::Q8x32",
+            "SiteEntry::F32 => SiteAct::F32",
+            "SiteEntry::Q5_0 => SiteAct::Q8Blocks32",
+            "q8_1 blocks of 128 values",
+        ] {
+            assert!(site.contains(line), "kernels.rs no longer says {line:?}");
+        }
+        assert!(
+            gemm.contains("(Q8_0, IQ4_NL, Q5_1), over [`GemmAct32`]"),
+            "gemm/mod.rs no longer names the 32-value family"
+        );
+        for variant in ["Iq3Xxs", "Iq4Xs"] {
+            assert!(
+                grouped.contains(variant),
+                "the grouped GEMM no longer decodes {variant}"
+            );
+        }
+    }
+
     /// ik's side of the table is the transcription this module already holds for the K-quants
     /// ([`Rule::of`]), and so is ours for Q3_K and Q4_K; Q5_K's ours differs from it by design (the
     /// V4.1 gemv reads f32, the bodies' site reads q8_1).
