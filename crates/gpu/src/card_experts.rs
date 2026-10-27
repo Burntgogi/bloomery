@@ -1036,6 +1036,18 @@ mod tests {
     /// step, pass, batch and tier chunks as the same common leg. Host slots
     /// stay untouched on the tier, including a chunk's short final run.
     #[test]
+    fn the_leg_buffers_hold_the_card_downs_forms() {
+        let q8 = DownForms::of(DownAct::Q8Act);
+        let b32 = DownForms::of(DownAct::Q8Blocks32);
+        assert_eq!(card_downs(DownForms::NONE), q8);
+        assert_eq!(card_downs(q8), q8);
+        assert_eq!(card_downs(b32), b32);
+        assert!(!card_downs(b32).holds(DownAct::Q8Act));
+        let both = q8.with(DownAct::Q8Blocks32);
+        assert_eq!(card_downs(both), both);
+    }
+
+    #[test]
     #[ignore = "needs a CUDA device; `just gate-gpu-lib` runs it on the box"]
     fn hw_mixed_card_and_tier_wrappers_conserve_forms_and_rows() {
         use GgmlType::{IQ3_S, IQ4_XS, Q5_K, Q6_K, Q8_0};
