@@ -12,17 +12,13 @@ use crate::buffer::MetalRaw;
 use crate::device::MetalDevice;
 use crate::encode::{Binding, Bindings, ComputeEncoder};
 use crate::fault::MetalFaultWord;
+use crate::geom::ExpertsGeom;
 use crate::library::{Library, Pipeline};
 
-use super::experts_geom::{EXPERT_K, EXPERT_SLOTS, FOLDED_BLOCKS, ROUTED_IDS};
 use super::{Quant, args_bytes, check_window_len, pack, word};
 
 const PAIR: &str = "pair";
 const FOLD: &str = "fold";
-/// Blocks of K': nine slots, two blocks of [`EXPERT_K`] each, in the
-/// 256-value quants' blocks (A4's and Q8_0's folds walk their own counts).
-const _: () = assert!(super::geometry::BLOCK_VALUES == 256);
-const _: () = assert!(FOLDED_BLOCKS == EXPERT_SLOTS * (EXPERT_K / super::geometry::BLOCK_VALUES));
 
 /// The shared expert, or a refusal when its quant is not the routed experts'.
 #[derive(Clone, Copy)]
@@ -31,18 +27,23 @@ pub enum SharedPlan<'w> {
     Same(Window<'w, u8, MetalDevice>),
     /// The shared expert's quant differs. The launch is refused by name.
     Apart,
+    /// The layer has no shared expert: the slots are the routed picks, and
+    /// the instance's experts have no shared slot.
+    None,
 }
 
-/// One gate-up pair: nine slots, each `silu(gate · x̂) * (up · x̂)` over `cols`
-/// inputs, `x̂ = x * gain / sqrt(mean(x^2) + eps)`. A norm that finds a value
+/// One gate-up pair: the instance's slots (the routed picks, then the
+/// shared expert's when the instance has one), each
+/// `silu(gate · x̂) * (up · x̂)` over `cols` inputs, `x̂ = x * gain / sqrt(mean(x^2) + eps)`. A norm that finds a value
 /// that is not finite, or a zero scale, raises the norm site of `layer` on
 /// `fault` and writes NaN to its rows.
 pub struct PairParams<'w> {
     /// The weight type. A layer's experts are one type.
     pub quant: Quant,
-    /// The slots. A launch runs [`EXPERT_SLOTS`].
+    /// The slots. A launch runs the instance's (`ExpertsGeom::slots`).
     pub slots: usize,
-    /// The expert intermediate width. A launch runs [`EXPERT_K`].
+    /// The expert intermediate width. A launch runs the instance's
+    /// (`ExpertsGeom::k`).
     pub k: usize,
     /// The input columns, a positive multiple of the type's block values.
     pub cols: usize,
@@ -54,19 +55,20 @@ pub struct PairParams<'w> {
     pub gate: Window<'w, u8, MetalDevice>,
     /// The up stack, the gate's shape.
     pub up: Window<'w, u8, MetalDevice>,
-    /// The shared expert's gate, one expert.
-    pub shared_gate: Window<'w, u8, MetalDevice>,
-    /// The shared expert's up, one expert.
-    pub shared_up: Window<'w, u8, MetalDevice>,
+    /// The shared expert's gate, one expert: given exactly when the
+    /// instance's experts have a shared slot.
+    pub shared_gate: Option<Window<'w, u8, MetalDevice>>,
+    /// The shared expert's up, one expert, given with the gate.
+    pub shared_up: Option<Window<'w, u8, MetalDevice>>,
     /// The input, `cols` values, before the norm.
     pub x: Window<'w, f32, MetalDevice>,
     /// The norm's gain, `cols` values.
     pub gain: Window<'w, f32, MetalDevice>,
     /// The epsilon added to the mean of the squares.
     pub eps: f32,
-    /// The nine slot outputs. Slot `s` starts at `s * out_stride`.
+    /// The slot outputs. Slot `s` starts at `s * out_stride`.
     pub y: WindowMut<'w, f32, MetalDevice>,
-    /// Floats from one slot's output to the next. Below [`EXPERT_K`] the
+    /// Floats from one slot's output to the next. Below the expert width the
     /// slots overlap and the launch is refused.
     pub out_stride: usize,
     /// The fault word an id past the stack or a norm that cannot take its
@@ -76,7 +78,8 @@ pub struct PairParams<'w> {
     pub layer: u32,
 }
 
-/// One folded down: `y += sum_s w_s * down_s · h_s` over nine slots.
+/// One folded down: `y += sum_s w_s * down_s · h_s` over the instance's
+/// slots.
 pub struct FoldParams<'w, 'h, 'y, 'buf> {
     /// The weight type. The shared expert is the same type, or [`SharedPlan::Apart`].
     pub quant: Quant,
@@ -84,9 +87,9 @@ pub struct FoldParams<'w, 'h, 'y, 'buf> {
     pub shared: SharedPlan<'w>,
     /// The output rows.
     pub rows: usize,
-    /// The slots. A launch runs [`EXPERT_SLOTS`].
+    /// The slots. A launch runs the instance's (`ExpertsGeom::slots`).
     pub slots: usize,
-    /// The expert width. A launch runs [`EXPERT_K`].
+    /// The expert width. A launch runs the instance's (`ExpertsGeom::k`).
     pub k: usize,
     /// Experts in the stack.
     pub n_experts: usize,
@@ -94,9 +97,9 @@ pub struct FoldParams<'w, 'h, 'y, 'buf> {
     pub ids: Window<'w, i32, MetalDevice>,
     /// The down stack: `n_experts` experts of `rows` by `k`.
     pub down: Window<'w, u8, MetalDevice>,
-    /// Nine activation vectors of `k`, concatenated.
+    /// One activation vector of `k` a slot, concatenated.
     pub h: Window<'h, f32, MetalDevice>,
-    /// Nine route weights, one per slot, applied as the block is loaded.
+    /// One route weight a slot, applied as the block is loaded.
     pub w: Window<'w, f32, MetalDevice>,
     /// The residual. The kernel adds into it. A shared borrow: the binding
     /// reads the window, and a caller can pair it with a read view of the
@@ -116,23 +119,23 @@ fn refuse_fold(detail: impl Into<String>) -> DeviceError {
     super::range(FOLD, detail)
 }
 
-fn refuse_slots(what: &'static str, slots: usize) -> Result<(), DeviceError> {
-    if slots == EXPERT_SLOTS {
+fn refuse_slots(g: &ExpertsGeom, what: &'static str, slots: usize) -> Result<(), DeviceError> {
+    if slots == g.slots {
         return Ok(());
     }
     Err(super::range(
         what,
-        format!("a launch runs {EXPERT_SLOTS} slots, not {slots}"),
+        format!("a launch runs {} slots, not {slots}", g.slots),
     ))
 }
 
-fn refuse_k(what: &'static str, k: usize) -> Result<(), DeviceError> {
-    if k == EXPERT_K {
+fn refuse_k(g: &ExpertsGeom, what: &'static str, k: usize) -> Result<(), DeviceError> {
+    if k == g.k {
         return Ok(());
     }
     Err(super::range(
         what,
-        format!("the expert width is {k}, not {EXPERT_K}"),
+        format!("the expert width is {k}, not {}", g.k),
     ))
 }
 
@@ -184,15 +187,16 @@ struct PairShape {
 }
 
 fn check_pair(
+    g: &ExpertsGeom,
     p: &PairParams<'_>,
     simdgroups: usize,
     rows_per_simd_group: usize,
 ) -> Result<PairShape, DeviceError> {
-    refuse_slots(PAIR, p.slots)?;
-    refuse_k(PAIR, p.k)?;
+    refuse_slots(g, PAIR, p.slots)?;
+    refuse_k(g, PAIR, p.k)?;
     refuse_stack(PAIR, p.n_experts)?;
     refuse_ids(PAIR, p.ids.len())?;
-    if p.out_stride < EXPERT_K {
+    if p.out_stride < g.k {
         return Err(refuse_pair("the slot outputs overlap".to_string()));
     }
     if !p.cols.is_multiple_of(p.quant.values_per_block()) || p.cols == 0 {
@@ -203,38 +207,59 @@ fn check_pair(
         )));
     }
     let nblocks = p.cols / p.quant.values_per_block();
-    let stack = weight_bytes(p.quant, EXPERT_K, nblocks, p.n_experts).ok_or_else(|| {
+    let stack = weight_bytes(p.quant, g.k, nblocks, p.n_experts).ok_or_else(|| {
         refuse_pair(format!(
             "{} experts of {} columns wrap",
             p.n_experts, p.cols
         ))
     })?;
-    let shared = weight_bytes(p.quant, EXPERT_K, nblocks, 1)
+    let shared_bytes = weight_bytes(p.quant, g.k, nblocks, 1)
         .ok_or_else(|| refuse_pair("one shared expert wraps".to_string()))?;
-    let y_len = (EXPERT_SLOTS - 1)
+    let shared = match (p.shared_gate, p.shared_up, g.has_shared) {
+        (Some(gate), Some(up), true) => Some((gate, up)),
+        (None, None, false) => None,
+        (None, None, true) => {
+            return Err(refuse_pair(
+                "no shared expert, and the experts run a shared slot".to_string(),
+            ));
+        }
+        (Some(_), Some(_), false) => {
+            return Err(refuse_pair(
+                "a shared expert, and the experts run no shared slot".to_string(),
+            ));
+        }
+        _ => {
+            return Err(refuse_pair(
+                "a shared expert's gate without its up, or its up without its gate".to_string(),
+            ));
+        }
+    };
+    let y_len = (g.slots - 1)
         .checked_mul(p.out_stride)
-        .and_then(|n| n.checked_add(EXPERT_K))
+        .and_then(|n| n.checked_add(g.k))
         .ok_or_else(|| refuse_pair("the output length wraps".to_string()))?;
     check_window_len(PAIR, "gate", p.gate.len(), stack)?;
     check_window_len(PAIR, "up", p.up.len(), stack)?;
-    check_window_len(PAIR, "shared gate", p.shared_gate.len(), shared)?;
-    check_window_len(PAIR, "shared up", p.shared_up.len(), shared)?;
+    if let Some((gate, up)) = shared {
+        check_window_len(PAIR, "shared gate", gate.len(), shared_bytes)?;
+        check_window_len(PAIR, "shared up", up.len(), shared_bytes)?;
+        aligned(PAIR, "shared gate", gate)?;
+        aligned(PAIR, "shared up", up)?;
+    }
     check_window_len(PAIR, "x", p.x.len(), p.cols)?;
     check_window_len(PAIR, "gain", p.gain.len(), p.cols)?;
-    check_window_len(PAIR, "ids", p.ids.len(), ROUTED_IDS)?;
+    check_window_len(PAIR, "ids", p.ids.len(), g.routed_ids)?;
     check_window_len(PAIR, "y", p.y.len(), y_len)?;
     aligned(PAIR, "gate", p.gate)?;
     aligned(PAIR, "up", p.up)?;
-    aligned(PAIR, "shared gate", p.shared_gate)?;
-    aligned(PAIR, "shared up", p.shared_up)?;
     Ok(PairShape {
         nblocks: word(PAIR, "the block count", nblocks)?,
-        rows: word(PAIR, "the row count", EXPERT_K)?,
+        rows: word(PAIR, "the row count", g.k)?,
         n_experts: word(PAIR, "the expert count", p.n_experts)?,
         stride: word(PAIR, "the output stride", p.out_stride)?,
         // A SIMD group owns the geometry's weight rows, a gate and an up to
         // an output.
-        groups_x: EXPERT_K.div_ceil(simdgroups * rows_per_simd_group / 2),
+        groups_x: g.k.div_ceil(simdgroups * rows_per_simd_group / 2),
     })
 }
 
@@ -245,20 +270,32 @@ struct FoldShape {
 }
 
 fn check_fold<'w>(
+    g: &ExpertsGeom,
     p: &FoldParams<'w, '_, '_, '_>,
     simdgroups: usize,
     rows_per_simd_group: usize,
 ) -> Result<(FoldShape, Window<'w, u8, MetalDevice>), DeviceError> {
-    let shared = match p.shared {
-        SharedPlan::Apart => {
+    let shared = match (p.shared, g.has_shared) {
+        (SharedPlan::Apart, _) => {
             return Err(refuse_fold(
                 "the shared expert is SharedPlan::Apart".to_string(),
             ));
         }
-        SharedPlan::Same(window) => window,
+        (SharedPlan::Same(window), true) => Some(window),
+        (SharedPlan::None, false) => None,
+        (SharedPlan::Same(_), false) => {
+            return Err(refuse_fold(
+                "a shared expert, and the experts run no shared slot".to_string(),
+            ));
+        }
+        (SharedPlan::None, true) => {
+            return Err(refuse_fold(
+                "no shared expert, and the experts run a shared slot".to_string(),
+            ));
+        }
     };
-    refuse_slots(FOLD, p.slots)?;
-    refuse_k(FOLD, p.k)?;
+    refuse_slots(g, FOLD, p.slots)?;
+    refuse_k(g, FOLD, p.k)?;
     refuse_stack(FOLD, p.n_experts)?;
     refuse_ids(FOLD, p.ids.len())?;
     if hidden_overlaps_output(p.h, p.y)? {
@@ -269,20 +306,22 @@ fn check_fold<'w>(
     if p.rows == 0 {
         return Err(refuse_fold("no rows".to_string()));
     }
-    let nblocks = EXPERT_K / p.quant.values_per_block();
+    let nblocks = g.k / p.quant.values_per_block();
     let stack = weight_bytes(p.quant, p.rows, nblocks, p.n_experts)
         .ok_or_else(|| refuse_fold(format!("{} experts of {} rows wrap", p.n_experts, p.rows)))?;
     let shared_bytes = weight_bytes(p.quant, p.rows, nblocks, 1)
         .ok_or_else(|| refuse_fold("one shared expert wraps".to_string()))?;
-    let hidden = EXPERT_SLOTS * EXPERT_K;
+    let hidden = g.slots * g.k;
     check_window_len(FOLD, "down", p.down.len(), stack)?;
-    check_window_len(FOLD, "shared down", shared.len(), shared_bytes)?;
+    if let Some(shared) = shared {
+        check_window_len(FOLD, "shared down", shared.len(), shared_bytes)?;
+        aligned(FOLD, "shared down", shared)?;
+    }
     check_window_len(FOLD, "hidden", p.h.len(), hidden)?;
-    check_window_len(FOLD, "route", p.w.len(), EXPERT_SLOTS)?;
-    check_window_len(FOLD, "ids", p.ids.len(), ROUTED_IDS)?;
+    check_window_len(FOLD, "route", p.w.len(), g.slots)?;
+    check_window_len(FOLD, "ids", p.ids.len(), g.routed_ids)?;
     check_window_len(FOLD, "y", p.y.len(), p.rows)?;
     aligned(FOLD, "down", p.down)?;
-    aligned(FOLD, "shared down", shared)?;
     let rows_per_group = simdgroups * rows_per_simd_group;
     Ok((
         FoldShape {
@@ -290,7 +329,9 @@ fn check_fold<'w>(
             n_experts: word(FOLD, "the expert count", p.n_experts)?,
             groups_x: p.rows.div_ceil(rows_per_group),
         },
-        shared,
+        // An instance with no shared slot binds the stack in its place,
+        // which the kernel does not read.
+        shared.unwrap_or(p.down),
     ))
 }
 
@@ -348,15 +389,20 @@ impl Pipelines {
 }
 
 impl super::Kernels {
-    /// Encode one gate-up pair. Nine slots, one dispatch; nothing is encoded
-    /// for a launch that is refused.
+    /// Encode one gate-up pair. The instance's slots, one dispatch; nothing
+    /// is encoded for a launch that is refused.
     #[must_use = "a refused launch encoded nothing"]
     pub fn pair(
         &self,
         encoder: &mut ComputeEncoder<'_>,
         p: PairParams<'_>,
     ) -> Result<(), DeviceError> {
-        let shape = check_pair(&p, self.simdgroups, self.rows_per_simd_group)?;
+        let shape = check_pair(
+            &self.geom.experts,
+            &p,
+            self.simdgroups,
+            self.rows_per_simd_group,
+        )?;
         let args = args_bytes([
             shape.rows,
             shape.nblocks,
@@ -369,15 +415,21 @@ impl super::Kernels {
         let mut slot = Bindings::new(encoder);
         slot.set(Binding::of(&p.gate)?)?;
         slot.set(Binding::of(&p.up)?)?;
-        slot.set(Binding::of(&p.shared_gate)?)?;
-        slot.set(Binding::of(&p.shared_up)?)?;
+        // An instance with no shared slot binds the stacks in their places,
+        // which the kernel does not read.
+        slot.set(Binding::of(p.shared_gate.as_ref().unwrap_or(&p.gate))?)?;
+        slot.set(Binding::of(p.shared_up.as_ref().unwrap_or(&p.up))?)?;
         slot.set(Binding::of(&p.x)?)?;
         slot.set(Binding::of(&p.gain)?)?;
         slot.set(Binding::of(&p.ids)?)?;
         slot.set(Binding::of_mut(&p.y)?)?;
         slot.set(p.fault.binding())?;
         slot.set(Binding::bytes(pack(&args))?)?;
-        slot.dispatch_groups(shape.groups_x, EXPERT_SLOTS, self.threads_per_group())
+        slot.dispatch_groups(
+            shape.groups_x,
+            self.geom.experts.slots,
+            self.threads_per_group(),
+        )
     }
 
     /// Encode one folded down. The route weights scale the load, and the
@@ -389,7 +441,12 @@ impl super::Kernels {
         encoder: &mut ComputeEncoder<'_>,
         p: FoldParams<'_, '_, '_, '_>,
     ) -> Result<(), DeviceError> {
-        let (shape, shared) = check_fold(&p, self.simdgroups, self.rows_per_simd_group)?;
+        let (shape, shared) = check_fold(
+            &self.geom.experts,
+            &p,
+            self.simdgroups,
+            self.rows_per_simd_group,
+        )?;
         let args = args_bytes([shape.rows, shape.n_experts, p.layer, 0]);
         encoder.set_pipeline(self.experts.fold(p.quant));
         let mut slot = Bindings::new(encoder);
