@@ -122,7 +122,15 @@ impl Target for Session {
             )));
         }
         // The id at an inner point is stepped by the next span, after the take.
-        let points = self.checkpoint_marks(from, to);
+        // With no recurrent store the call takes no checkpoint: its end is
+        // its one point, and a mark has nothing to copy.
+        let mut points = self.checkpoint_marks(from, to);
+        let marks = if points.is_empty() {
+            points.push(to);
+            &[][..]
+        } else {
+            marks
+        };
         let call = Call {
             ids,
             from,
