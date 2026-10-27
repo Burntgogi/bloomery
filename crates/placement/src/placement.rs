@@ -4473,7 +4473,7 @@ impl Plan<'_> {
         if rows.next().is_some() {
             return Ok(None);
         }
-        if name != workstation::TIER_BATCH_RESERVE {
+        if name != workstation::TIER_BATCH_RESERVE || card.tier_leg.is_none() {
             return Ok(Some(*bytes));
         }
         let counts = match c.checked_sub(self.machine.cards.len()) {

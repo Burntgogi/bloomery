@@ -451,7 +451,7 @@ mod tests {
     }
 
     #[test]
-    #[should_panic]
+    #[should_panic(expected = "leg_bytes: scratch bytes overflow u64")]
     fn infallible_leg_sizing_refuses_overflow() {
         let _ = leg_bytes(1 << 61, 8, 256, 256, DownForms::of(DownAct::Q8Act));
     }
