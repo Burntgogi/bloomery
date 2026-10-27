@@ -940,6 +940,11 @@ q8_1 launch accounting. The Qwen3.8 admission fixture accepts its projected site
 retaining the K=640 shared-down refusal. IQ4 activation bands were not relaxed,
 and the removed source-text wiring guard was not restored.
 
+Every recipe that builds the shared `bloomery-serve` binary carries its required-feature
+union, including `flint`; this also applies to newly merged consumers such as
+`gate-gpu-llama-serve`. Recipe validation and actual model-fence opening must agree
+before a batch can schedule that consumer. This configuration check is not a GPU serve run.
+
 ### Measured head/upstream separation, not a precision fix
 
 A throwaway probe used the preserved mainline CPU backend
