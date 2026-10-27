@@ -99,8 +99,12 @@ budget regression exercises this distinction without a GPU, including OS reserve
 `Result<TierBatchBytes, PlacementError>` and construct candidate-selected descriptors.
 An empty tier selects no down form, matching `LegTier`'s actual allocation instead of
 advertising unused Q8Act scratch. Qwen3/Qwen35, MiMo and Muse use this checked path.
-MiniMax obtains its forms from `accepts::leg_down_forms` under its selected program,
-as GLM5Next and Solar do; no fallback format can admit a mismatched triple.
+Qwen3/Qwen35 and MiniMax derive their descriptor bounds from the described model's
+admitted forms through `accepts::leg_down_forms`, as GLM5Next and Solar do.
+The Qwen public wrappers take `PlanInputs`, not geometry alone: a supported
+Q8_0, Q5_1 or IQ4_NL candidate must not fail the whole plan just because its
+32-value form remains unselected at the tier's budget boundary.
+No fallback format can admit a mismatched triple.
 The checked constructors and non-leg paths share staging and host byte formulas.
 Malformed geometry and overflow are refused rather than panicking; a dense Qwen3.6
 request for an expert tier is a named metadata refusal, not zero expert geometry.

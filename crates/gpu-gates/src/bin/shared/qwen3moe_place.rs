@@ -271,8 +271,8 @@ fn laid(
         [stage] => workstation::placed_with_arena(*stage, layers, arena),
         [stage, tier] => {
             let batch = match inputs {
-                Inputs::Qwen3(i) => q3::tier_batch(&i.hp),
-                Inputs::Qwen35(i) => q35::leg_tier_batch(&i.spec),
+                Inputs::Qwen3(i) => q3::tier_batch(i),
+                Inputs::Qwen35(i) => q35::leg_tier_batch(i),
             }?;
             let mut machine = workstation::plan_tiers(layers, *stage, &[*tier], None, batch)?;
             q3::stage_placed(&mut machine, arena);
