@@ -140,9 +140,16 @@ not a new full-library run of the review repairs.
 
 The component subsequently merges pinned upstream `cb8d92ebddd1ce1a325a15450c06a01f57ecf88c`.
 That reconciliation retains upstream's GLM mixer-form consumers alongside this component's
-checked tier-byte API; the explicit-form API has no input-scale flag. The execution results
-above belong to their named historical sources, not the merged source. No new runtime or
-canonical-equivalence result is claimed by this merge.
+checked tier-byte API; the explicit-form API has no input-scale flag. The GPU results
+above belong to their named historical sources, not the merged source.
+
+At merged source `c38d603ca1d33c6c2bede63aba102199715fb9ef`, native formatting and
+all-target Clippy passed, as did chain23, GGUF67, model559 and placement202
+(five model cases ignored, zero failed/filtered). The actual oxide-linked
+`a_dense_header_plans_through_qwen35_on` frontend consumer passed1 case,
+0 failed/ignored,6 filtered, including the named expert-tier refusal.
+This is metadata-only host execution, not fresh NVIDIA execution of the merged source
+or a whole-model numerical result.
 
 The host-only public planner consumer covers one-byte boundaries before the first resident layer
 and before adding another down form, plus descriptor overflow refusal. These and the CUDA consumer
