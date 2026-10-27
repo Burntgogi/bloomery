@@ -217,7 +217,7 @@ Its fresh4bin/8carrier canonical comparison again found all1657entries identical
 with non-JIT rows equal. Native formatting/Clippy passed (warning3=ratchet3); model557 and
 placement202 passed,0 failed,5 model tests ignored,0 filtered.
 
-The reviewed component source `7e37ef9a6ebbd766032ee521a0ee16e25f163851`
+The historical component contract source `7e37ef9a6ebbd766032ee521a0ee16e25f163851`
 executed the real CUDA mixed/empty-tier consumer on RTX3090 cc8.6:1 passed,
 0 failed/ignored,427 filtered,23.98s. Its metadata-only
 `a_dense_header_plans_through_qwen35_on` frontend consumer also passed1 case,
