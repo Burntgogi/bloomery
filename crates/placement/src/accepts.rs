@@ -248,7 +248,8 @@ pub fn qwen35_leg([gate, up, down]: [GgmlType; 3]) -> Option<LegSplit> {
 /// is `None`. An NVFP4 site has a gemv and no wide GEMM, which the body's
 /// prompt units run every dense site through, and is `None`. A BF16 site
 /// reads the words only a load under `ModelTensors::bf16_words` keeps, which
-/// the qwen3moe files do not set, and is `None`. The body's load and the
+/// the qwen3moe files do not set, and is `None`. Its legacy shared-expert
+/// dispatch does not feed IQ4_XS sites either. The body's load and the
 /// coverage census both read this, so a site the arena cannot feed is
 /// refused at load and listed together.
 #[must_use]
@@ -256,7 +257,7 @@ pub const fn qwen3moe_dense(ty: GgmlType) -> Option<SiteEntry> {
     let Some(entry) = kernels::dense(ty) else {
         return None;
     };
-    if let SiteEntry::Nvfp4 | SiteEntry::Bf16 = entry {
+    if let SiteEntry::Nvfp4 | SiteEntry::Bf16 | SiteEntry::Iq4xs = entry {
         return None;
     }
     match entry.reads() {
@@ -277,7 +278,7 @@ pub const fn dense_by_name(ty: GgmlType) -> Option<SiteEntry> {
 
 /// The dense sites launched by name over up to eight columns on every family
 /// the table's dense row names but Q5_0 (`site::ByName`): the f32-row entries
-/// beside those that read q8_1 blocks of 128 (the K-quants, NVFP4), whose
+/// beside those that read q8_1 blocks of 128 (the K-quants, IQ4_XS, NVFP4), whose
 /// activation the unit quantizes itself. Q5_0 reads 32-value blocks no
 /// by-name unit holds.
 #[must_use]
@@ -1128,6 +1129,7 @@ mod tests {
         assert_eq!(qwen3moe_dense(GgmlType::Q5_0), None);
         assert_eq!(qwen3moe_dense(GgmlType::NVFP4), None);
         assert_eq!(qwen3moe_dense(GgmlType::BF16), None);
+        assert_eq!(qwen3moe_dense(GgmlType::IQ4_XS), None);
         assert_eq!(head_of_widened(GgmlType::BF16), None);
         assert_eq!(embed_of_widened(GgmlType::BF16), None);
         assert!(head_of_widened(GgmlType::Q8_0).is_some());

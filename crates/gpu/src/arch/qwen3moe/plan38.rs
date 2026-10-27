@@ -484,7 +484,7 @@ fn gqa_fits(g: &Gqa) -> bool {
 /// Every layer's plan from its kind, `ple` the PLE site's layer, each weight
 /// checked against the geometry: type and shape. A dense projection, the
 /// indexer's two among them, is of a type the common site projects by name
-/// (`site::PROJECTED`: the f32 rows' families and the K-quants), each
+/// (`site::PROJECTED`: the f32 rows' families, the K-quants and IQ4_XS), each
 /// tensor's own: the walks pick its launch by the resident form. The joined
 /// β·α stack is of an f32 rows' family (`site::BY_NAME`). An HC matrix is one
 /// `HcMatrix::of` reads. The gains, the conv and the injects are F32 (the
@@ -648,7 +648,7 @@ const SUPER_BLOCK: usize = 256;
 
 /// The resident weight `name`, `rows` rows of `k` values, of a type a
 /// by-name projection launches (`site::PROJECTED`: every dense family but
-/// Q5_0, the K-quants and NVFP4 over the q8_1 rows of their input); another
+/// Q5_0, the K-quants, IQ4_XS and NVFP4 over the q8_1 rows of their input); another
 /// type or shape is refused by name.
 fn projected_shape(w: &Weights, name: &str, rows: usize, k: usize) -> Result<(), GpuError> {
     let ty = dense::resident_site(w, WHAT, name, (rows, k), &dense::PROJECTED)?;
