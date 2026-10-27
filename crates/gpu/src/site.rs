@@ -2101,7 +2101,7 @@ mod tests {
             );
         }
         assert_eq!(
-            file_site(&file, "test", "shared", (2, 256), SiteTy::ALL).ok(),
+            file_site(&file, "test", "shared", (2, 256), &super::PROJECTED).ok(),
             Some(SiteTy::Iq4Xs)
         );
         for (name, shape, allowed) in [
