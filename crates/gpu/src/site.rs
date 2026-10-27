@@ -2056,8 +2056,16 @@ mod tests {
         }
     }
 
+    /// A site's type is read from the file's header alone: a Q8_0 matrix of
+    /// two rows of 64 is read as Q8_0 where Q8_0 is launched, and refused by
+    /// name where only K-quants are; a Q3_K, a Q5_K, a Q5_0, an IQ4_XS, an MXFP8
+    /// (bloomery's id, sized by the split) and a BF16 one are read as theirs; an
+    /// IQ3_S one (a type no site launch reads), a matrix of another shape and a
+    /// type outside the allowed list are refused by name.
+    ///
+    /// PIN(2026-10-27): the refused type with no launch was IQ4_XS; it is a site family now (`SiteTy::Iq4Xs`), so IQ3_S stands in and IQ4_XS joins the read types.
     #[test]
-    fn iq4_sites_keep_shape_and_launch_admission_separate() {
+    fn a_site_type_comes_from_the_header_and_a_type_with_no_launch_is_refused() {
         let decl = |name: &str, ty: GgmlType, bytes| TensorDecl {
             name: name.to_owned(),
             dims: vec![256, 2],
@@ -2102,21 +2110,36 @@ mod tests {
             file_site(&file, "test", "shared", (2, 256), &super::PROJECTED).ok(),
             Some(SiteTy::Iq4Xs)
         );
-        for (name, shape, allowed) in [
-            ("shared", (1, 256), SiteTy::ALL),
-            ("shared", (2, 512), SiteTy::ALL),
-            ("shared", (2, 256), &[SiteTy::Q4K][..]),
-            ("unsupported", (2, 256), SiteTy::ALL),
+        for (name, shape, allowed, want) in [
+            (
+                "q8",
+                (2, 64),
+                &[SiteTy::Q4K, SiteTy::Q6K][..],
+                "q8 is q8_0 in the file",
+            ),
+            (
+                "shared",
+                (2, 256),
+                &[SiteTy::Q4K][..],
+                "shared is iq4_xs in the file",
+            ),
+            (
+                "unsupported",
+                (2, 256),
+                SiteTy::ALL,
+                "unsupported is iq3_s in the file",
+            ),
+            ("q8", (4, 64), SiteTy::ALL, "it takes 4 rows of 64"),
+            ("shared", (1, 256), SiteTy::ALL, "it takes 1 rows of 256"),
+            ("shared", (2, 512), SiteTy::ALL, "it takes 2 rows of 512"),
         ] {
             let Err(chain::ChainError::Shape { what, detail }) =
                 file_site(&file, "test", name, shape, allowed)
             else {
-                panic!(
-                    "{name}: invalid shape or launch admission was not refused as a shape error"
-                );
+                panic!("{name} {shape:?}: not refused as a shape error");
             };
             assert_eq!(what, "test");
-            assert!(detail.contains(name), "{name}: {detail}");
+            assert!(detail.contains(want), "{name}: {detail}");
         }
     }
 
@@ -2184,6 +2207,88 @@ mod tests {
         }
     }
 
+<<<<<<< ours
+=======
+    /// Every family is the kernel table's dense row of one file type: a type
+    /// has a family exactly where the table names a dense entry for it (F16,
+    /// which loads widened to f32, is the f32 site of its widened rows), the
+    /// family maps back to that type and is named by it in upper case, its
+    /// grouped GEMM is the one the table names for the type, it is a
+    /// `kgemv` exactly where it reads the q8_1 rows of 128 values, it
+    /// launches by name (`BY_NAME`) exactly where it reads the f32 rows or
+    /// the q8 blocks of 32, and by projection (`PROJECTED`) exactly where the
+    /// table names a dense entry but Q5_0's.
+    #[test]
+    fn every_family_is_the_tables_dense_row_of_one_type() {
+        // PIN(2026-10-21): consolidate the three site pins, preserving their assertions.
+        let own = [
+            GgmlType::F8E4M3_ROWS,
+            GgmlType::MXFP8,
+            GgmlType::NVFP4_ROWS,
+            GgmlType::FP8_B128,
+        ];
+        for ty in gguf::QROWS.iter().map(|r| r.ty).chain(own) {
+            let family = SiteTy::of_ggml(ty);
+            if ty == GgmlType::F16 {
+                assert_eq!(
+                    family,
+                    Some(SiteTy::F32),
+                    "{ty}: the f32 site of its widened rows"
+                );
+                assert_eq!(kernels::dense(ty), None, "{ty}");
+                continue;
+            }
+            assert_eq!(family.is_some(), kernels::dense(ty).is_some(), "{ty}");
+            if let Some(s) = family {
+                assert_eq!(s.ggml(), ty, "{s}");
+            }
+        }
+        let expected = [
+            (SiteTy::Q3K, GgmlType::Q3_K, "Q3_K", Some(GemmWeight::Q3K)),
+            (SiteTy::Q4K, GgmlType::Q4_K, "Q4_K", Some(GemmWeight::Q4K)),
+            (SiteTy::Q5K, GgmlType::Q5_K, "Q5_K", Some(GemmWeight::Q5K)),
+            (SiteTy::Q6K, GgmlType::Q6_K, "Q6_K", Some(GemmWeight::Q6K)),
+            (SiteTy::Q5_0, GgmlType::Q5_0, "Q5_0", None),
+            (SiteTy::Q8_0, GgmlType::Q8_0, "Q8_0", None),
+            (SiteTy::F32, GgmlType::F32, "F32", None),
+            (SiteTy::Nvfp4, GgmlType::NVFP4, "NVFP4", None),
+            (SiteTy::Mxfp8, GgmlType::MXFP8, "MXFP8", None),
+            (SiteTy::Fp8B128, GgmlType::FP8_B128, "FP8_B128", None),
+            (SiteTy::Bf16, GgmlType::BF16, "BF16", None),
+            (
+                SiteTy::Iq4Xs,
+                GgmlType::IQ4_XS,
+                "IQ4_XS",
+                Some(GemmWeight::Iq4Xs),
+            ),
+        ];
+        assert_eq!(SiteTy::ALL.len(), expected.len());
+        for (&s, (want, ty, label, grouped)) in SiteTy::ALL.iter().zip(expected) {
+            assert_eq!(s, want);
+            assert_eq!(s.ggml(), ty);
+            assert_eq!(s.to_string(), label);
+            assert_eq!(gemm_weight(s), grouped);
+            assert_eq!(kgemv_order(s).is_some(), s.reads() == Form::Q8x128);
+            let by_name = model::placement::accepts::dense_by_name(ty);
+            assert_eq!(super::BY_NAME.contains(&s), by_name.is_some(), "{s}");
+            if let Some(entry) = by_name {
+                assert_eq!(SiteTy::of_entry(entry), Some(s), "{s}");
+            }
+            let projected = model::placement::accepts::dense_projected(ty);
+            assert_eq!(super::PROJECTED.contains(&s), projected.is_some(), "{s}");
+            if let Some(entry) = projected {
+                assert_eq!(SiteTy::of_entry(entry), Some(s), "{s}");
+            }
+        }
+        assert_eq!(SiteTy::Q5_0.reads(), Form::Q8Blocks32);
+        assert_eq!(kgemv_order(SiteTy::Q5_0), None);
+        assert_eq!(SiteTy::Nvfp4.reads(), Form::Q8x128);
+        assert_eq!(kgemv_order(SiteTy::Nvfp4), Some(Order::TokenMajor));
+        assert_eq!(SiteTy::Mxfp8.reads(), Form::F32);
+        assert_eq!(kgemv_order(SiteTy::Iq4Xs), Some(Order::TokenMajor));
+    }
+
+>>>>>>> theirs
     #[test]
     fn a_bf16_site_reads_the_f32_rows_and_is_a_gemv() {
         assert_eq!(SiteTy::of_ggml(GgmlType::BF16), Some(SiteTy::Bf16));

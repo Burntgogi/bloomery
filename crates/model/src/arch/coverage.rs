@@ -3602,8 +3602,15 @@ mod tests {
     // PIN(2026-10-26): the K-quants (Q3_K to Q6_K) joined the dense sites' set: both walks project a site by name
     // (`site::ByName`), the q8_1 quantization and the K-quant gemv by chunks on the ubatch walk. The shared expert's
     // down keeps the f32-row types: K = 640 is not whole super-blocks.
+<<<<<<< ours
     // IQ4_XS sites likewise read q8_1 through the selected one-expert dispatch; the shared down
     // still refuses them because its K = 640 is not whole super-blocks.
+=======
+    // PIN(2026-10-27): IQ4_XS joined the dense sites' set: the kernel table names it a dense entry (`SiteEntry::Iq4xs`)
+    // that reads the q8_1 blocks of 128 like the K-quants, so `dense_projected` keeps it and `site::PROJECTED` holds it.
+    // Derivation: the projections by name run it, and the shared expert's down (K = 640, `dense_by_name` omits it) is
+    // refused as a K-quant's is.
+>>>>>>> theirs
     #[test]
     fn the_qwen38_dense_pins_read_the_projected_sites() {
         let q8_1 = [
