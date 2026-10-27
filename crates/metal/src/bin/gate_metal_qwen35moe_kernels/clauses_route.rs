@@ -12,7 +12,9 @@
 //!   most [`ROUTE_TILE`] in group order, against the host rule below.
 //! - `grouped_gemm`: the SwiGLU pair and the down over the table's tiles, for
 //!   the fixture's real gate, up and down stacks, each (row, slot) held to the
-//!   f64 oracle's band, the shared expert's group included.
+//!   f64 oracle's band, the shared expert's group included when the router has
+//!   one. `grouped_q6_down` runs the Q6_K down of a file whose down type
+//!   varies.
 //! - `combine`: the residual plus the slots' outputs in slot order, bit for
 //!   bit against the same f32 sum.
 //! - `headnorm_rows`: the numerator times each head's scale against f64.
@@ -30,6 +32,7 @@
 //! band (`oracle_experts::pair_width`); the route weight multiplies once.
 
 use std::collections::HashMap;
+use std::ops::Range;
 
 use bloomery_device::conformance::{Clause, Verdict, why};
 use bloomery_device::fault::FaultSite;
@@ -77,6 +80,12 @@ pub struct Dims {
 }
 
 impl Dims {
+    /// The ids a row of the selection writes: the picks, and the shared
+    /// expert's id when the router has a shared row.
+    fn row_ids(&self) -> usize {
+        self.top_k + self.shared
+    }
+
     fn of(h: &Harness<'_>) -> Self {
         let g = h.geom();
         Self {
@@ -174,16 +183,22 @@ struct Selected {
     fault: Option<Fault>,
 }
 
+/// Words past the selection's ids and weights, left as they were: a row
+/// written at a stride wider than the router's lands in them, not in the next
+/// buffer.
+const SELECT_GUARD: usize = 64;
+
 fn select_run(h: &Harness<'_>, rows: &[&Decoded]) -> Result<Selected, String> {
     let d = Dims::of(h);
     let n = rows.len();
+    let written = n * d.row_ids();
     let mut logits = vec![sentinel(); n * d.logit_stride];
     for (r, row) in rows.iter().enumerate() {
         logits[r * d.logit_stride..r * d.logit_stride + d.rows].copy_from_slice(&row.logits);
     }
     let logits_b = upload(h, &logits)?;
-    let mut ids = upload(h, &vec![0xFFFF_FFFFu32; n * (d.top_k + 1)])?;
-    let mut weights = upload(h, &vec![sentinel(); n * (d.top_k + 1)])?;
+    let mut ids = upload(h, &vec![0xFFFF_FFFFu32; written + SELECT_GUARD])?;
+    let mut weights = upload(h, &vec![sentinel(); written + SELECT_GUARD])?;
     h.clear_fault()?;
     h.encode(|encoder| {
         h.kernels.route_rows_select(
@@ -193,29 +208,43 @@ fn select_run(h: &Harness<'_>, rows: &[&Decoded]) -> Result<Selected, String> {
                 top_k: d.top_k,
                 logits: logits_b.window(Elems(0), Elems(logits.len()))?,
                 logit_stride: d.logit_stride,
-                ids: ids.window_mut(Elems(0), Elems(n * (d.top_k + 1)))?,
-                weights: weights.window_mut(Elems(0), Elems(n * (d.top_k + 1)))?,
+                ids: ids.window_mut(Elems(0), Elems(written))?,
+                weights: weights.window_mut(Elems(0), Elems(written))?,
                 fault: h.device.fault_word(),
                 layer: LAYER,
             },
         )
     })?;
+    let mut ids = read(h, &ids, written + SELECT_GUARD)?;
+    let mut weights = read(h, &weights, written + SELECT_GUARD)?;
+    if ids[written..].iter().any(|&id| id != 0xFFFF_FFFF)
+        || weights[written..]
+            .iter()
+            .any(|w| w.to_bits() != SENTINEL_BITS)
+    {
+        return Err(format!(
+            "the selection wrote past its {written} ids and weights ({n} rows of {})",
+            d.row_ids()
+        ));
+    }
+    ids.truncate(written);
+    weights.truncate(written);
     Ok(Selected {
-        ids: read(h, &ids, n * (d.top_k + 1))?,
-        weights: read(h, &weights, n * (d.top_k + 1))?,
+        ids,
+        weights,
         fault: h.fault()?,
     })
 }
 
 fn same_selection(d: Dims, got: &Selected, rows: &[&Decoded]) -> Result<(), String> {
     for (r, row) in rows.iter().enumerate() {
-        let at = r * (d.top_k + 1);
+        let at = r * d.row_ids();
         same_words(
             &format!("row {r} ids"),
-            &got.ids[at..at + d.top_k + 1],
+            &got.ids[at..at + d.row_ids()],
             &row.ids,
         )?;
-        let gw: Vec<u32> = got.weights[at..at + d.top_k + 1]
+        let gw: Vec<u32> = got.weights[at..at + d.row_ids()]
             .iter()
             .map(|v| v.to_bits())
             .collect();
@@ -237,9 +266,10 @@ pub fn route_rows_select(h: &Harness<'_>, fixture: &Fixture) -> Clause {
         cases.push(decoded(h, &routed, &shared, 0x700 + seed, eps)?);
     }
     // Ties: three routed rows equal to one another, so three logits are the
-    // same bits and the smaller ids win.
+    // same bits and the smaller ids win. The two copies' rows wrap into a
+    // router of fewer experts.
     let mut tied = oracle::activations(d.experts * d.k, 0x5EF, 0.05);
-    for e in [77usize, 200] {
+    for e in [77usize % d.experts, 200 % d.experts] {
         tied.copy_within(3 * d.k..4 * d.k, e * d.k);
     }
     cases.push(decoded(h, &tied, &zero_shared, 0x710, eps)?);
@@ -258,14 +288,20 @@ pub fn route_rows_select(h: &Harness<'_>, fixture: &Fixture) -> Clause {
         return Err(format!("clean logits raised {f}"));
     }
     same_selection(d, &got, &refs)?;
-    // A logit that is not finite: the decode router's own fallback.
-    let routed = oracle::activations(d.experts * d.k, 0x5F0, 0.05);
+    // A logit that is not finite: the decode router's own fallback. The
+    // router's last row carries it: the shared expert's gate, or the last
+    // routed expert's when the router has no shared row.
+    let mut routed = oracle::activations(d.experts * d.k, 0x5F0, 0.05);
     let mut nan_shared = vec![0.01f32; d.k];
-    nan_shared[10] = f32::NAN;
+    if d.shared == 1 {
+        nan_shared[10] = f32::NAN;
+    } else {
+        routed[(d.experts - 1) * d.k + 10] = f32::NAN;
+    }
     let bad = decoded(h, &routed, &nan_shared, 0x720, eps)?;
     expect_site(
         h.fault()?,
-        "the decode router on a NaN shared row",
+        "the decode router on a NaN logit in its last row",
         FaultSite::Router,
     )?;
     let got = select_run(h, &[&bad])?;
@@ -292,7 +328,7 @@ fn table_run(h: &Harness<'_>, ids: &[u32]) -> Result<Table, String> {
     let ids_b = upload(h, ids)?;
     let mut sorted = upload(h, &vec![0xFFFF_FFFFu32; slots])?;
     let mut inv = upload(h, &vec![0xFFFF_FFFFu32; slots])?;
-    let words = route_table_words(slots, d.experts);
+    let words = route_table_words(slots, d.rows);
     let mut tiles = upload(h, &vec![0xFFFF_FFFFu32; words])?;
     h.clear_fault()?;
     h.encode(|encoder| {
@@ -320,7 +356,8 @@ fn table_run(h: &Harness<'_>, ids: &[u32]) -> Result<Table, String> {
 }
 
 /// The slots of `rows` rows over the experts the picks name: row `r` picks
-/// `picks(r)` and the shared expert last. A row's picks are distinct.
+/// `picks(r)` and the shared expert last when the router has one. A row's
+/// picks are distinct.
 pub struct Picks {
     pub ids: Vec<u32>,
 }
@@ -342,7 +379,9 @@ pub fn picks(d: Dims, rows: usize, hot: Option<u32>, seed: u64) -> Picks {
             }
         }
         ids.extend(row);
-        ids.push(d.experts as u32);
+        if d.shared == 1 {
+            ids.push(d.experts as u32);
+        }
     }
     Picks { ids }
 }
@@ -426,7 +465,7 @@ fn check_table(d: Dims, ids: &[u32], t: &Table, what: &str) -> Result<usize, Str
             ));
         }
     }
-    let cap = route_table_words(slots, d.experts);
+    let cap = route_table_words(slots, d.rows);
     if t.tiles[4 * (1 + n)..cap].iter().any(|&w| w != 0xFFFF_FFFF) {
         return Err(format!("{what}: a word past the last tile was written"));
     }
@@ -441,7 +480,7 @@ pub fn route_table(h: &Harness<'_>, _fixture: &Fixture) -> Clause {
         (1usize, None),
         (9, None),
         (40, Some(5u32)),
-        (130, Some(255)),
+        (130, Some(d.experts as u32 - 1)),
     ] {
         let ids = picks(d, rows, hot, 0x7AB + rows as u64).ids;
         let t = table_run(h, &ids)?;
@@ -449,10 +488,18 @@ pub fn route_table(h: &Harness<'_>, _fixture: &Fixture) -> Clause {
         parts.push(format!("{rows}:{tiles}"));
     }
     // An id outside its slot's range raises the expert-id site, is placed in
-    // group 0, and moves no other slot's group.
+    // group 0, and moves no other slot's group. The second bad id is a
+    // shared slot's that is not the shared id; a router with no shared row
+    // has none, and the shared id (the group past the routed ones) in a routed
+    // slot takes its place.
     let mut ids = picks(d, 9, None, 0x7AC).ids;
+    let (second, second_id) = if d.shared == 1 {
+        (d.per_row + d.top_k, 17)
+    } else {
+        (d.per_row + 3, d.experts as u32)
+    };
     ids[4] = d.experts as u32 + 3;
-    ids[d.per_row + 8] = 17;
+    ids[second] = second_id;
     let t = table_run(h, &ids)?;
     expect_site(
         t.fault,
@@ -461,7 +508,7 @@ pub fn route_table(h: &Harness<'_>, _fixture: &Fixture) -> Clause {
     )?;
     let mut fixed = ids.clone();
     fixed[4] = 0;
-    fixed[d.per_row + 8] = 0;
+    fixed[second] = 0;
     let mut clean = t;
     clean.fault = None;
     for (p, &s) in clean.sorted.iter().enumerate() {
@@ -484,9 +531,14 @@ pub fn route_table(h: &Harness<'_>, _fixture: &Fixture) -> Clause {
 
 // ------------------------------------------------------------- grouped gemm
 
-/// A family's stacks and shared tensors, for the pair and the down.
+/// A family's stacks and shared tensors, for the pair and the down. The
+/// shared tensors are empty when the router has no shared row.
 struct Experts {
+    /// The gate and up stacks' type.
     quant: Quant,
+    /// The down stack's type: the pair's, or the type of a layer whose down
+    /// is wider.
+    down_quant: Quant,
     dims: Dims,
     gate: Vec<u8>,
     up: Vec<u8>,
@@ -511,10 +563,26 @@ fn stack(
     Ok(out)
 }
 
+/// The shared tensor `name`'s bytes when the router has a shared row, none
+/// otherwise.
+fn shared_rows(
+    d: Dims,
+    fix: &Fixture,
+    name: &str,
+    ty: GgmlType,
+    (cols, rows): (usize, usize),
+) -> Result<Vec<u8>, String> {
+    if d.shared == 0 {
+        return Ok(Vec::new());
+    }
+    Ok(fix.rows(name, ty, cols, rows)?.to_vec())
+}
+
 fn experts_of(d: Dims, fix: &Fixture, quant: Quant) -> Result<Experts, String> {
     let ty = quant.ggml();
     Ok(Experts {
         quant,
+        down_quant: quant,
         dims: d,
         gate: stack(
             d.experts,
@@ -540,15 +608,32 @@ fn experts_of(d: Dims, fix: &Fixture, quant: Quant) -> Result<Experts, String> {
             d.expert_k,
             d.k,
         )?,
-        shared_gate: fix
-            .rows("blk.0.ffn_gate_shexp.weight", ty, d.k, d.expert_k)?
-            .to_vec(),
-        shared_up: fix
-            .rows("blk.0.ffn_up_shexp.weight", ty, d.k, d.expert_k)?
-            .to_vec(),
-        shared_down: fix
-            .rows("blk.0.ffn_down_shexp.weight", ty, d.expert_k, d.k)?
-            .to_vec(),
+        shared_gate: shared_rows(d, fix, "blk.0.ffn_gate_shexp.weight", ty, (d.k, d.expert_k))?,
+        shared_up: shared_rows(d, fix, "blk.0.ffn_up_shexp.weight", ty, (d.k, d.expert_k))?,
+        shared_down: shared_rows(d, fix, "blk.0.ffn_down_shexp.weight", ty, (d.expert_k, d.k))?,
+    })
+}
+
+/// The family of the Q4_K pair over a Q6_K down: layer 0's gate and up, and
+/// the down stack of the first layer the fixture keeps at Q6_K, as a model
+/// whose layers differ in the down's type runs them. The router has no shared
+/// row: the shared expert of such a file has no second type to run.
+fn q6_down_experts(d: Dims, fix: &Fixture) -> Result<Experts, String> {
+    if d.shared == 1 {
+        return Err("the Q6_K-down family is written for a router with no shared row".to_string());
+    }
+    let layer = fix.first_layer_of("ffn_down_exps.weight", GgmlType::Q6_K)?;
+    Ok(Experts {
+        down_quant: Quant::Q6K,
+        down: stack(
+            d.experts,
+            fix,
+            &format!("blk.{layer}.ffn_down_exps.weight"),
+            GgmlType::Q6_K,
+            d.expert_k,
+            d.k,
+        )?,
+        ..experts_of(d, fix, Quant::Q4K)?
     })
 }
 
@@ -556,15 +641,23 @@ fn experts_of(d: Dims, fix: &Fixture, quant: Quant) -> Result<Experts, String> {
 /// quant no fixture holds: every expert its own rows, each stack and shared
 /// tensor from its own seed.
 fn synthetic_experts(d: Dims, quant: Quant, seed: u64) -> Experts {
+    let shared = |rows: usize, cols: usize, seed: u64| {
+        if d.shared == 1 {
+            synthetic::matrix(quant, rows, cols, seed)
+        } else {
+            Vec::new()
+        }
+    };
     Experts {
         quant,
+        down_quant: quant,
         dims: d,
         gate: synthetic::matrix(quant, d.experts * d.expert_k, d.k, seed),
         up: synthetic::matrix(quant, d.experts * d.expert_k, d.k, seed + 1),
         down: synthetic::matrix(quant, d.experts * d.k, d.expert_k, seed + 2),
-        shared_gate: synthetic::matrix(quant, d.expert_k, d.k, seed + 3),
-        shared_up: synthetic::matrix(quant, d.expert_k, d.k, seed + 4),
-        shared_down: synthetic::matrix(quant, d.k, d.expert_k, seed + 5),
+        shared_gate: shared(d.expert_k, d.k, seed + 3),
+        shared_up: shared(d.expert_k, d.k, seed + 4),
+        shared_down: shared(d.k, d.expert_k, seed + 5),
     }
 }
 
@@ -641,7 +734,7 @@ fn grouped_run(
         kernels: h.kernels,
         sorted: &table.sorted,
         tiles: &table.tiles,
-        max_tiles: route_tiles(sc.rows * d.per_row, d.experts),
+        max_tiles: route_tiles(sc.rows * d.per_row, d.rows),
     };
     let out = grouped_launch(h, ex, sc, operand, &over)?;
     Ok(Grouped {
@@ -687,9 +780,16 @@ fn grouped_launch(
     let gate = bytes(h, &ex.gate)?;
     let up = bytes(h, &ex.up)?;
     let down = bytes(h, &ex.down)?;
-    let sgate = bytes(h, &ex.shared_gate)?;
-    let sup = bytes(h, &ex.shared_up)?;
-    let sdown = bytes(h, &ex.shared_down)?;
+    // The shared tensors exist when the router has a shared row.
+    let shared = if d.shared == 1 {
+        Some([
+            bytes(h, &ex.shared_gate)?,
+            bytes(h, &ex.shared_up)?,
+            bytes(h, &ex.shared_down)?,
+        ])
+    } else {
+        None
+    };
     let mut hid = upload(h, &vec![sentinel(); slots * d.expert_k])?;
     let mut out = upload(h, &vec![sentinel(); slots * d.k])?;
     let max_tiles = over.max_tiles;
@@ -706,8 +806,14 @@ fn grouped_launch(
                 experts: d.experts,
                 stack: gate.window(Elems(0), Elems(ex.gate.len()))?,
                 stack_up: Some(up.window(Elems(0), Elems(ex.up.len()))?),
-                shared: sgate.window(Elems(0), Elems(ex.shared_gate.len()))?,
-                shared_up: Some(sup.window(Elems(0), Elems(ex.shared_up.len()))?),
+                shared: shared
+                    .as_ref()
+                    .map(|s| s[0].window(Elems(0), Elems(ex.shared_gate.len())))
+                    .transpose()?,
+                shared_up: shared
+                    .as_ref()
+                    .map(|s| s[1].window(Elems(0), Elems(ex.shared_up.len())))
+                    .transpose()?,
                 x: x_b.window(Elems(0), Elems(sc.x.len()))?,
                 x_rows: sc.rows,
                 x_stride: d.k,
@@ -730,7 +836,7 @@ fn grouped_launch(
         over.kernels.gemm_routed(
             encoder,
             RoutedParams {
-                quant: ex.quant,
+                quant: ex.down_quant,
                 kind: RoutedKind::Plain,
                 operand,
                 cols: d.expert_k,
@@ -738,7 +844,10 @@ fn grouped_launch(
                 experts: d.experts,
                 stack: down.window(Elems(0), Elems(ex.down.len()))?,
                 stack_up: None,
-                shared: sdown.window(Elems(0), Elems(ex.shared_down.len()))?,
+                shared: shared
+                    .as_ref()
+                    .map(|s| s[2].window(Elems(0), Elems(ex.shared_down.len())))
+                    .transpose()?,
                 shared_up: None,
                 x: hid.window(Elems(0), Elems(slots * d.expert_k))?,
                 x_rows: slots,
@@ -812,7 +921,7 @@ fn check_grouped(
     let d = ex.dims;
     let slots = sc.rows * d.per_row;
     let (f_pair, ops_pair) = gemm_band(ex.quant, d.k, operand, path);
-    let (f_down, ops_down) = gemm_band(ex.quant, d.expert_k, operand, path);
+    let (f_down, ops_down) = gemm_band(ex.down_quant, d.expert_k, operand, path);
     // The f32 arm has no cast, so no subnormal term; its band is the dense
     // GEMM's own (`gemm_band`), and the subnormal terms are the f16 arm's.
     let sub = match operand {
@@ -821,6 +930,10 @@ fn check_grouped(
     };
     let mut abs = AbsSums {
         quant: ex.quant,
+        cache: HashMap::new(),
+    };
+    let mut abs_down = AbsSums {
+        quant: ex.down_quant,
         cache: HashMap::new(),
     };
     let mut worst_pair = 0f64;
@@ -871,8 +984,8 @@ fn check_grouped(
             .collect();
         let h_abs: f64 = hx.iter().map(|v| v.abs()).sum();
         let down = ex.of(&ex.down, &ex.shared_down, e);
-        let rd = oracle::reference(ex.quant, down, d.k, d.expert_k, &hx)?;
-        let wd = abs.of(2, e, down, d.k, d.expert_k)?.to_vec();
+        let rd = oracle::reference(ex.down_quant, down, d.k, d.expert_k, &hx)?;
+        let wd = abs_down.of(2, e, down, d.k, d.expert_k)?.to_vec();
         for (n, &wd_n) in wd.iter().enumerate().take(d.k) {
             let width = dot_width(f_down, ops_down, sub, rd.magnitude[n], h_abs, wd_n);
             let got = f64::from(run.y[p * d.k + n]);
@@ -922,10 +1035,15 @@ fn range_fault(h: &Harness<'_>, ex: &Experts) -> Result<(), String> {
 
 fn grouped_quant(h: &Harness<'_>, ex: &Experts, operands: &[Operand]) -> Result<String, String> {
     let quant = ex.quant;
+    let label = if ex.down_quant == quant {
+        quant.name().to_string()
+    } else {
+        format!("{} with a {} down", quant.name(), ex.down_quant.name())
+    };
     let mut parts = Vec::new();
     for &operand in operands {
         // A tile and eight rows: every row picks the hot expert, so its
-        // group and the shared group both take two tiles.
+        // group, and the shared group when there is one, take two tiles.
         let sc = scene(ex.dims, ROUTE_TILE + 8, Some(5), 0x6A0);
         let run = grouped_run(h, ex, &sc, operand)?;
         for (what, fault) in [("pair", run.pair_fault), ("down", run.down_fault)] {
@@ -935,37 +1053,34 @@ fn grouped_quant(h: &Harness<'_>, ex: &Experts, operands: &[Operand]) -> Result<
         }
         let (pair, down) =
             check_grouped(ex, &sc, &run, operand, 7, Some(5), h.kernels.gemm_path())?;
-        parts.push(format!(
-            "{} {operand:?} pair {pair:.3} down {down:.3}",
-            quant.name()
-        ));
+        parts.push(format!("{label} {operand:?} pair {pair:.3} down {down:.3}"));
     }
     if operands.contains(&Operand::F16) {
         range_fault(h, ex)?;
         parts.push(format!(
-            "{} an activation past the half range is the fault and NaN",
-            quant.name()
+            "{label} an activation past the half range is the fault and NaN"
         ));
     }
     Ok(parts.join(", "))
 }
 
 /// The pair and the down over the table's tiles are the oracle's, for every
-/// (row, slot), the shared expert's group and a group of two tiles included.
-pub fn grouped_gemm(h: &Harness<'_>, fixture: &Fixture, mlx: &Result<Fixture, String>) -> Clause {
+/// (row, slot), the shared expert's group (when the router has one) and a
+/// group of two tiles included. `a4` is the MLX fixture of the A4 family, for
+/// the instance whose gate runs it.
+pub fn grouped_gemm(h: &Harness<'_>, fixture: &Fixture, a4: Option<&Fixture>) -> Clause {
     let d = Dims::of(h);
     let mut notes = vec![grouped_quant(
         h,
         &experts_of(d, fixture, Quant::Q4K)?,
         &[Operand::F16, Operand::F32],
     )?];
-    match mlx {
-        Ok(m) => notes.push(grouped_quant(
+    if let Some(m) = a4 {
+        notes.push(grouped_quant(
             h,
             &experts_of(d, m, Quant::A4)?,
             &[Operand::F16],
-        )?),
-        Err(e) => return Err(format!("the A4 fixture: {e}")),
+        )?);
     }
     Ok(Verdict::Noted(format!(
         "worst error over its band: {}",
@@ -993,6 +1108,7 @@ fn q6k_experts(d: Dims, fix: &Fixture) -> Result<Experts, String> {
     };
     Ok(Experts {
         quant: Quant::Q6K,
+        down_quant: Quant::Q6K,
         dims: d,
         gate: cycled(0, d.experts * d.expert_k),
         up: cycled(qkv_rows / 2, d.experts * d.expert_k),
@@ -1010,6 +1126,45 @@ fn q6k_experts(d: Dims, fix: &Fixture) -> Result<Experts, String> {
             .rows("blk.2.ffn_down_shexp.weight", ty, d.expert_k, d.k)?
             .to_vec(),
     })
+}
+
+/// What a launch over a table with one tile the grouped GEMM refuses leaves:
+/// the pair and the down raise the expert-id site, the tile's `places` hold
+/// no store of either, and the place after them (the next tile's first) is
+/// stored.
+fn expect_refused(out: &Outs, d: Dims, places: Range<usize>, what: &str) -> Result<(), String> {
+    expect_site(
+        out.pair_fault,
+        &format!("the pair on {what}"),
+        FaultSite::ExpertId,
+    )?;
+    expect_site(
+        out.down_fault,
+        &format!("the down on {what}"),
+        FaultSite::ExpertId,
+    )?;
+    for p in places.clone() {
+        for (side, row) in [
+            ("pair", &out.h[p * d.expert_k..(p + 1) * d.expert_k]),
+            ("down", &out.y[p * d.k..(p + 1) * d.k]),
+        ] {
+            if let Some(v) = row.iter().find(|v| v.to_bits() != SENTINEL_BITS) {
+                return Err(format!(
+                    "the {side} stored {v:?} at place {p} of the refused tile"
+                ));
+            }
+        }
+    }
+    let after = places.end;
+    if out.h[after * d.expert_k..(after + 1) * d.expert_k]
+        .iter()
+        .any(|v| v.to_bits() == SENTINEL_BITS)
+    {
+        return Err(format!(
+            "place {after}, the next tile's first, was not stored"
+        ));
+    }
+    Ok(())
 }
 
 /// A tile the table cannot write — its run one slot longer than a tile —
@@ -1031,41 +1186,89 @@ fn bad_tile(h: &Harness<'_>, ex: &Experts) -> Result<(), String> {
         kernels: h.kernels,
         sorted: &table.sorted,
         tiles: &tiles,
-        max_tiles: route_tiles(sc.rows * d.per_row, d.experts),
+        max_tiles: route_tiles(sc.rows * d.per_row, d.rows),
     };
     let out = grouped_launch(h, ex, &sc, Operand::F16, &over)?;
-    expect_site(
-        out.pair_fault,
-        "the pair on a tile past the tile's slots",
-        FaultSite::ExpertId,
-    )?;
-    expect_site(
-        out.down_fault,
-        "the down on a tile past the tile's slots",
-        FaultSite::ExpertId,
-    )?;
-    for p in first..first + count {
-        for (what, row) in [
-            ("pair", &out.h[p * d.expert_k..(p + 1) * d.expert_k]),
-            ("down", &out.y[p * d.k..(p + 1) * d.k]),
-        ] {
-            if let Some(v) = row.iter().find(|v| v.to_bits() != SENTINEL_BITS) {
-                return Err(format!(
-                    "the {what} stored {v:?} at place {p} of the bad tile"
-                ));
-            }
+    expect_refused(
+        &out,
+        d,
+        first..first + count,
+        "a tile past the tile's slots",
+    )
+}
+
+/// The table's group one past the routed experts: the shared expert's when
+/// the instance has one, a group the table cannot write when it has none. A
+/// hand-built table of two tiles, that group over the first two rows' places
+/// and the last routed expert over the rest. With a shared group both tiles
+/// are the oracle's within the band, the first against the shared tensors;
+/// with none the first raises the expert-id site in the pair and in the down
+/// and stores nothing, and the second is stored. Returns what it showed.
+fn past_routed(h: &Harness<'_>, ex: &Experts) -> Result<&'static str, String> {
+    let d = ex.dims;
+    let mut sc = scene(d, 4, None, 0x6A3);
+    let slots = sc.rows * d.per_row;
+    let cut = 2 * d.per_row;
+    let (past, last) = (d.experts as u32, d.experts as u32 - 1);
+    // The oracle reads a slot's group from the scene's ids.
+    sc.ids = (0..slots)
+        .map(|s| if s < cut { past } else { last })
+        .collect();
+    let max_tiles = route_tiles(slots, d.rows);
+    let mut tiles = vec![0xFFFF_FFFFu32; 4 * (1 + max_tiles)];
+    tiles[..12].copy_from_slice(&[
+        2,
+        0,
+        0,
+        0,
+        past,
+        0,
+        cut as u32,
+        0,
+        last,
+        cut as u32,
+        (slots - cut) as u32,
+        0,
+    ]);
+    let sorted: Vec<u32> = (0..slots as u32).collect();
+    let over = OverTable {
+        kernels: h.kernels,
+        sorted: &sorted,
+        tiles: &tiles,
+        max_tiles,
+    };
+    let out = grouped_launch(h, ex, &sc, Operand::F16, &over)?;
+    if d.shared == 0 {
+        expect_refused(
+            &out,
+            d,
+            0..cut,
+            "a tile of the group past the routed experts",
+        )?;
+        return Ok(
+            "the group past the routed experts raises the expert-id site and stores nothing",
+        );
+    }
+    for (side, fault) in [("pair", out.pair_fault), ("down", out.down_fault)] {
+        if let Some(f) = fault {
+            return Err(format!("the {side} on the shared group's tile raised {f}"));
         }
     }
-    let after = first + count;
-    if out.h[after * d.expert_k..(after + 1) * d.expert_k]
-        .iter()
-        .any(|v| v.to_bits() == SENTINEL_BITS)
-    {
-        return Err(format!(
-            "place {after}, the next tile's first, was not stored"
-        ));
-    }
-    Ok(())
+    let run = Grouped {
+        h: out.h,
+        y: out.y,
+        table: Table {
+            inv: sorted.clone(),
+            sorted,
+            tiles,
+            fault: None,
+        },
+        pair_fault: None,
+        down_fault: None,
+    };
+    check_grouped(ex, &sc, &run, Operand::F16, 1, None, h.kernels.gemm_path())
+        .map_err(|e| format!("the shared group's tile: {e}"))?;
+    Ok("the group past the routed experts is the shared expert's, within the band")
 }
 
 /// The grouped GEMM's every arm of one weight type on `h`'s kernels (the
@@ -1075,7 +1278,8 @@ fn bad_tile(h: &Harness<'_>, ex: &Experts) -> Result<(), String> {
 /// group's), which end inside a SIMD group's second block of places and
 /// inside the second group's first; an activation past the half range the
 /// fault and NaN; a tile past the tile's slots the expert-id site with
-/// nothing stored.
+/// nothing stored; the group past the routed experts the shared expert's or
+/// that site, by whether the instance has one.
 fn grouped_arms(h: &Harness<'_>, ex: &Experts) -> Clause {
     let note = grouped_quant(h, ex, &[Operand::F16, Operand::F32])?;
     let mut runs = Vec::new();
@@ -1102,8 +1306,9 @@ fn grouped_arms(h: &Harness<'_>, ex: &Experts) -> Clause {
         runs.push(format!("runs of {rows} pair {pair:.3} down {down:.3}"));
     }
     bad_tile(h, ex)?;
+    let past = past_routed(h, ex)?;
     Ok(Verdict::Noted(format!(
-        "{} kernels, worst error over its band: {note}, {}; a tile past the tile's slots raises the expert-id site and stores nothing",
+        "{} kernels, worst error over its band: {note}, {}; a tile past the tile's slots raises the expert-id site and stores nothing; {past}",
         h.kernels.gemm_path().name(),
         runs.join(", ")
     )))
@@ -1119,6 +1324,12 @@ pub fn tensor_grouped_q6k(h: &Harness<'_>, fixture: &Fixture) -> Clause {
 
 pub fn tensor_grouped_a4(h: &Harness<'_>, mlx: &Fixture) -> Clause {
     grouped_arms(h, &experts_of(Dims::of(h), mlx, Quant::A4)?)
+}
+
+/// The grouped GEMM's every arm over the Q4_K pair and a Q6_K down, as a
+/// layer of a file whose down type varies runs them.
+pub fn grouped_q6_down(h: &Harness<'_>, fixture: &Fixture) -> Clause {
+    grouped_arms(h, &q6_down_experts(Dims::of(h), fixture)?)
 }
 
 /// Every grouped arm of `quant` on `h`'s kernels over synthetic stacks:
@@ -1142,7 +1353,7 @@ const ORACLE_TILE: usize = 32;
 /// Rows of the oracle scene, and the run lengths each of its eight lanes
 /// cuts them into: every A fragment count of a tile, the fragment boundaries
 /// 8 k and 8 k + 1, a full tile, and groups of two and three tiles (the
-/// shared group's three among them).
+/// last lane's three among them).
 const LANE_ROWS: usize = 136;
 const LANES: [&[usize]; 8] = [
     &[1, 7, 8, 9, 15, 16, 17, 63],
@@ -1196,8 +1407,9 @@ fn oracle_kernels(h: &Harness<'_>) -> Result<Kernels, String> {
     Kernels::from_library(&library).map_err(why)
 }
 
-/// The oracle scene: row r takes, in lane j, the expert 32 j + i of the run
-/// i its lane puts r in, then the shared expert.
+/// The oracle scene: row r takes, in lane j, the expert `experts / 8 * j + i`
+/// of the run i its lane puts r in, then the shared expert when the router
+/// has one.
 fn lane_scene(d: Dims) -> Result<Scene, String> {
     if ROUTE_TILE != 64 {
         return Err(format!(
@@ -1213,9 +1425,11 @@ fn lane_scene(d: Dims) -> Result<Scene, String> {
                 r < end
             });
             let i = run.ok_or_else(|| format!("lane {j}'s runs end before row {r}"))?;
-            ids.push((32 * j + i) as u32);
+            ids.push((d.experts / LANES.len() * j + i) as u32);
         }
-        ids.push(d.experts as u32);
+        if d.shared == 1 {
+            ids.push(d.experts as u32);
+        }
     }
     if let Some(j) = LANES
         .iter()
@@ -1274,16 +1488,16 @@ fn same_bits(what: &str, got: &[f32], want: &[f32], cols: usize) -> Result<(), S
 /// runs of every A fragment count, its boundaries and groups of several
 /// tiles: a tile's height and its split over the SIMD groups do not move an
 /// output's K order.
-pub fn grouped_oracle(h: &Harness<'_>, fixture: &Fixture, mlx: &Result<Fixture, String>) -> Clause {
+pub fn grouped_oracle(h: &Harness<'_>, fixture: &Fixture, a4: Option<&Fixture>) -> Clause {
     let d = Dims::of(h);
     let oracle = oracle_kernels(h)?;
     let sc = lane_scene(d)?;
-    let mlx = mlx.as_ref().map_err(|e| format!("the A4 fixture: {e}"))?;
+    let mut families = vec![(fixture, Quant::Q4K, &[Operand::F16, Operand::F32][..])];
+    if let Some(m) = a4 {
+        families.push((m, Quant::A4, &[Operand::F16][..]));
+    }
     let mut notes = Vec::new();
-    for (fix, quant, operands) in [
-        (fixture, Quant::Q4K, &[Operand::F16, Operand::F32][..]),
-        (mlx, Quant::A4, &[Operand::F16][..]),
-    ] {
+    for (fix, quant, operands) in families {
         let ex = experts_of(d, fix, quant)?;
         for &operand in operands {
             let ours = grouped_run(h, &ex, &sc, operand)?;
@@ -1324,7 +1538,7 @@ pub fn grouped_oracle(h: &Harness<'_>, fixture: &Fixture, mlx: &Result<Fixture, 
 
 // ------------------------------------------------------------------ combine
 
-/// `x += y[inv[row][0]] + ... + y[inv[row][8]]` in slot order, the sum started
+/// `x += y[inv[row][0]] + ... + y[inv[row][slots - 1]]` in slot order, the sum started
 /// at zero, bit for bit against the same f32 sum.
 pub fn combine(h: &Harness<'_>, _fixture: &Fixture) -> Clause {
     let d = Dims::of(h);
@@ -1365,7 +1579,11 @@ pub fn combine(h: &Harness<'_>, _fixture: &Fixture) -> Clause {
         }
     }
     let y_b = upload(h, &y)?;
-    let inv_b = upload(h, &inv)?;
+    // Zero words follow the places, so a sum that reads past them reads a
+    // place and not another buffer.
+    let mut inv_padded = inv.clone();
+    inv_padded.extend([0u32; 16]);
+    let inv_b = upload(h, &inv_padded)?;
     let mut x_b = upload(h, &x)?;
     h.encode(|encoder| {
         h.kernels.combine_rows(
@@ -1575,11 +1793,16 @@ pub fn route_refusals(h: &Harness<'_>, _fixture: &Fixture) -> Clause {
     let ids_b = upload(h, &vec![0u32; slots])?;
     let mut sorted = upload(h, &vec![0u32; slots])?;
     let mut inv = upload(h, &vec![0u32; slots])?;
-    let words = route_table_words(slots, d.experts);
+    let words = route_table_words(slots, d.rows);
     let mut tiles = upload(h, &vec![0u32; words])?;
     let logits_b = upload(h, &vec![0f32; 2 * d.logit_stride])?;
-    let mut sel_ids = upload(h, &vec![0u32; 2 * (d.top_k + 1)])?;
-    let mut sel_w = upload(h, &vec![0f32; 2 * (d.top_k + 1)])?;
+    let mut sel_ids = upload(h, &vec![0u32; 2 * d.row_ids()])?;
+    let mut sel_w = upload(h, &vec![0f32; 2 * d.row_ids()])?;
+    // The grouped GEMM's windows: the shared-tensor refusals come before any
+    // window's length is read, so each is a few words.
+    let weights_b = upload(h, &[0u8; 64])?;
+    let x_b = upload(h, &[0f32; 64])?;
+    let mut y_b = upload(h, &[0f32; 64])?;
     let mut checks = 0usize;
     let mut expect =
         |what: &str, needle: &str, got: Result<(), bloomery_device::DeviceError>| match got {
@@ -1646,6 +1869,20 @@ pub fn route_refusals(h: &Harness<'_>, _fixture: &Fixture) -> Clause {
             ),
         )?;
         expect(
+            "a row of slots that is not the instance's",
+            "slots a row",
+            table(
+                &mut enc,
+                &mut sorted,
+                &mut inv,
+                &mut tiles,
+                slots,
+                2 * d.per_row,
+                d.experts,
+                words,
+            ),
+        )?;
+        expect(
             "a table of the wrong length",
             "tiles window",
             table(
@@ -1689,11 +1926,84 @@ pub fn route_refusals(h: &Harness<'_>, _fixture: &Fixture) -> Clause {
                             .map_err(why)?,
                         logit_stride: stride,
                         ids: sel_ids
-                            .window_mut(Elems(0), Elems(2 * (d.top_k + 1)))
+                            .window_mut(Elems(0), Elems(2 * d.row_ids()))
                             .map_err(why)?,
                         weights: sel_w
-                            .window_mut(Elems(0), Elems(2 * (d.top_k + 1)))
+                            .window_mut(Elems(0), Elems(2 * d.row_ids()))
                             .map_err(why)?,
+                        fault: h.device.fault_word(),
+                        layer: LAYER,
+                    },
+                ),
+            )?;
+        }
+        // The grouped GEMM's up and shared tensors: the pair takes the up's
+        // stack (and the shared up with a shared expert), the plain tile
+        // neither, and a shared tensor is given exactly when the router has
+        // a shared row.
+        let shared_needle = if d.shared == 1 {
+            "has a shared group"
+        } else {
+            "has no shared group"
+        };
+        for (what, needle, kind, up, shared, shared_up) in [
+            (
+                "a pair with no up stack",
+                "up's stack",
+                RoutedKind::Pair,
+                false,
+                d.shared == 1,
+                d.shared == 1,
+            ),
+            (
+                "a plain tile with an up stack",
+                "takes neither",
+                RoutedKind::Plain,
+                true,
+                d.shared == 1,
+                false,
+            ),
+            (
+                "a shared tensor that disagrees with the router's shared row",
+                shared_needle,
+                RoutedKind::Pair,
+                true,
+                d.shared == 0,
+                d.shared == 0,
+            ),
+        ] {
+            let w = |on: bool| {
+                on.then(|| weights_b.window(Elems(0), Elems(1)))
+                    .transpose()
+                    .map_err(why)
+            };
+            expect(
+                what,
+                needle,
+                h.kernels.gemm_routed(
+                    &mut enc,
+                    RoutedParams {
+                        quant: Quant::Q4K,
+                        kind,
+                        operand: Operand::F16,
+                        cols: d.k,
+                        rows: 64,
+                        experts: d.experts,
+                        stack: weights_b.window(Elems(0), Elems(1)).map_err(why)?,
+                        stack_up: w(up)?,
+                        shared: w(shared)?,
+                        shared_up: w(shared_up)?,
+                        x: x_b.window(Elems(0), Elems(1)).map_err(why)?,
+                        x_rows: 1,
+                        x_stride: d.k,
+                        gather: true,
+                        y: y_b.window_mut(Elems(0), Elems(1)).map_err(why)?,
+                        y_stride: 64,
+                        slots: 1,
+                        max_tiles: 1,
+                        sorted: sorted.window(Elems(0), Elems(1)).map_err(why)?,
+                        route_w: x_b.window(Elems(0), Elems(1)).map_err(why)?,
+                        tiles: tiles.window(Elems(0), Elems(4)).map_err(why)?,
                         fault: h.device.fault_word(),
                         layer: LAYER,
                     },
@@ -1708,6 +2018,9 @@ pub fn route_refusals(h: &Harness<'_>, _fixture: &Fixture) -> Clause {
     )))
 }
 
+/// The clauses of the whole table: the routing and the grouped experts at the
+/// instance whose gate runs every clause, with the A4 family of its MLX
+/// fixture.
 pub fn table<'a>(
     ctx: &'a super::ClauseCtx<'a>,
     mlx: &'a Result<Fixture, String>,
@@ -1721,20 +2034,54 @@ pub fn table<'a>(
         ("route_table", Box::new(|| ctx.with(route_table))),
         (
             "grouped_gemm",
-            Box::new(|| match ctx.fixture {
-                Ok(fixture) => grouped_gemm(ctx.harness, fixture, mlx),
-                Err(e) => Err(e.clone()),
+            Box::new(move || match (ctx.fixture, mlx) {
+                (Ok(fixture), Ok(a4)) => grouped_gemm(ctx.harness, fixture, Some(a4)),
+                (Err(e), _) => Err(e.clone()),
+                (_, Err(e)) => Err(format!("the A4 fixture: {e}")),
             }),
         ),
         (
             "grouped_oracle",
-            Box::new(|| match ctx.fixture {
-                Ok(fixture) => grouped_oracle(ctx.harness, fixture, mlx),
-                Err(e) => Err(e.clone()),
+            Box::new(move || match (ctx.fixture, mlx) {
+                (Ok(fixture), Ok(a4)) => grouped_oracle(ctx.harness, fixture, Some(a4)),
+                (Err(e), _) => Err(e.clone()),
+                (_, Err(e)) => Err(format!("the A4 fixture: {e}")),
             }),
         ),
         ("combine", Box::new(|| ctx.with(combine))),
         ("headnorm_rows", Box::new(|| ctx.with(headnorm_rows))),
+        ("route_refusals", Box::new(|| ctx.with(route_refusals))),
+    ]
+}
+
+/// The clauses of the instance whose gate runs the kernels its geometry
+/// shapes: the routing and the grouped experts of a router with no shared row
+/// and layers of one weight family (Q4_K, with a Q6_K down in some), without
+/// the head-norm scale of the delta net and the MLX family.
+pub fn shaped<'a>(ctx: &'a super::ClauseCtx<'a>) -> Vec<(&'static str, super::ClauseRun<'a>)> {
+    vec![
+        ("gemm_f32w", Box::new(|| ctx.with(gemm_f32w))),
+        (
+            "route_rows_select",
+            Box::new(|| ctx.with(route_rows_select)),
+        ),
+        ("route_table", Box::new(|| ctx.with(route_table))),
+        (
+            "grouped_gemm",
+            Box::new(|| match ctx.fixture {
+                Ok(fixture) => grouped_gemm(ctx.harness, fixture, None),
+                Err(e) => Err(e.clone()),
+            }),
+        ),
+        ("grouped_q6_down", Box::new(|| ctx.with(grouped_q6_down))),
+        (
+            "grouped_oracle",
+            Box::new(|| match ctx.fixture {
+                Ok(fixture) => grouped_oracle(ctx.harness, fixture, None),
+                Err(e) => Err(e.clone()),
+            }),
+        ),
+        ("combine", Box::new(|| ctx.with(combine))),
         ("route_refusals", Box::new(|| ctx.with(route_refusals))),
     ]
 }

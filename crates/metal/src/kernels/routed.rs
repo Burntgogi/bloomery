@@ -4,11 +4,11 @@
 //! over rows. The kernels are `kernels/route.metal` and
 //! `kernels/gemm_routed.metal`.
 //!
-//! A pass of `rows` rows has `rows * 9` slots: a row's eight picks and the
-//! shared expert (the router's last row). The route table sorts the slots by
-//! expert, with the shared expert the 257th group; the grouped GEMM walks the
-//! table's tiles of at most [`ROUTE_TILE`] slots, each against its group's
-//! weights.
+//! A pass of `rows` rows has `rows * ExpertsGeom::slots` slots: a row's picks
+//! and, for an instance whose router has a shared row, the shared expert. The
+//! route table sorts the slots by expert, with the shared expert the group
+//! after the routed ones when there is one; the grouped GEMM walks the table's
+//! tiles of at most [`ROUTE_TILE`] slots, each against its group's weights.
 
 use bloomery_device::{DeviceError, Window, WindowMut};
 
@@ -46,19 +46,21 @@ pub const TABLE_THREADS: usize = 1024;
 /// The threads of the combine's threadgroup a row.
 const COMBINE_THREADS: usize = 256;
 
-/// The table's entries for `slots` slots over `experts` routed experts and
-/// the shared group: every group's tiles are full but its last, so the count
-/// is at most the slots' tiles plus one partial tile a group.
+/// The table's entries for `slots` slots over `groups` groups: every group's
+/// tiles are full but its last, so the count is at most the slots' tiles plus
+/// one partial tile a group. The groups are the instance's routed experts and
+/// its shared expert when it has one (`RouterGeom::rows`), so the bound counts
+/// no group the instance lacks.
 #[must_use]
-pub fn route_tiles(slots: usize, experts: usize) -> usize {
-    slots.div_ceil(ROUTE_TILE) + experts + 1
+pub fn route_tiles(slots: usize, groups: usize) -> usize {
+    slots.div_ceil(ROUTE_TILE) + groups
 }
 
 /// The words of the table: a header entry of four words, then one entry of
 /// four words (group, first place, slots, 0) a tile.
 #[must_use]
-pub fn route_table_words(slots: usize, experts: usize) -> usize {
-    4 * (1 + route_tiles(slots, experts))
+pub fn route_table_words(slots: usize, groups: usize) -> usize {
+    4 * (1 + route_tiles(slots, groups))
 }
 
 /// The grouped GEMM's pipelines of one weight type: the pair and the plain
@@ -172,10 +174,11 @@ pub struct RouteSelectParams<'w> {
     pub logits: Window<'w, f32, MetalDevice>,
     /// Elements between rows of `logits`.
     pub logit_stride: usize,
-    /// The ids, `top_k + 1` a row: the routed picks, then the shared id.
+    /// The ids, `top_k + RouterGeom::shared` a row: the routed picks, then the
+    /// shared id when the router has a shared row.
     pub ids: WindowMut<'w, u32, MetalDevice>,
-    /// The weights, `top_k + 1` a row: the softmax of the picks, then the
-    /// shared expert's sigmoid gate.
+    /// The weights, as many a row as the ids: the softmax of the picks, then
+    /// the shared expert's sigmoid gate when the router has a shared row.
     pub weights: WindowMut<'w, f32, MetalDevice>,
     /// The fault word a raise lands in.
     pub fault: &'w MetalFaultWord,
@@ -189,9 +192,11 @@ const TABLE_WHAT: &str = "route table";
 pub struct RouteTableParams<'w> {
     /// Slots in the pass, `rows * per_row`.
     pub slots: usize,
-    /// Slots a row holds: the picks and the shared expert.
+    /// Slots a row holds: the instance's (`ExpertsGeom::slots`), the picks and
+    /// the shared expert when it has one.
     pub per_row: usize,
-    /// The routed stack's experts; the shared expert is the group after them.
+    /// The routed stack's experts; the shared expert, when the instance has
+    /// one, is the group after them.
     pub experts: usize,
     /// Every slot's group (the select's ids).
     pub ids: Window<'w, u32, MetalDevice>,
@@ -249,9 +254,10 @@ pub struct RoutedParams<'w> {
     pub stack: Window<'w, u8, MetalDevice>,
     /// The up's stack, for the pair.
     pub stack_up: Option<Window<'w, u8, MetalDevice>>,
-    /// The shared expert's tensor: the gate's, or the down's.
-    pub shared: Window<'w, u8, MetalDevice>,
-    /// The shared expert's up, for the pair.
+    /// The shared expert's tensor, the gate's or the down's: given exactly
+    /// when the instance's router has a shared group.
+    pub shared: Option<Window<'w, u8, MetalDevice>>,
+    /// The shared expert's up, for the pair of an instance that has one.
     pub shared_up: Option<Window<'w, u8, MetalDevice>>,
     /// The activations: the pass's rows (`gather`) or the places' own.
     pub x: Window<'w, f32, MetalDevice>,
@@ -288,7 +294,7 @@ const COMBINE_WHAT: &str = "combine rows";
 pub struct CombineParams<'w> {
     /// Rows in the pass.
     pub rows: usize,
-    /// Slots a row holds.
+    /// Slots a row holds: the instance's (`ExpertsGeom::slots`).
     pub per_row: usize,
     /// The columns of a row, a multiple of four.
     pub cols: usize,
@@ -418,7 +424,7 @@ impl Kernels {
             p.logit_stride,
             router.rows,
         )?;
-        let per_row = p.top_k + 1;
+        let per_row = p.top_k + router.shared;
         let slots = p
             .rows
             .checked_mul(per_row)
@@ -456,21 +462,28 @@ impl Kernels {
                 p.slots, p.per_row
             )));
         }
-        if p.experts + 1 != self.geom.router.rows {
+        let router = &self.geom.router;
+        if p.per_row != self.geom.experts.slots {
             return Err(refuse(format!(
-                "{} routed experts; the table's groups are the router's {} rows",
-                p.experts, self.geom.router.rows
+                "{} slots a row; the instance's rows hold {}",
+                p.per_row, self.geom.experts.slots
+            )));
+        }
+        if p.experts + router.shared != router.rows {
+            return Err(refuse(format!(
+                "{} routed experts and {} shared groups; the table's groups are the router's {} rows",
+                p.experts, router.shared, router.rows
             )));
         }
         check_window_len(TABLE_WHAT, "ids", p.ids.len(), p.slots)?;
         check_window_len(TABLE_WHAT, "sorted", p.sorted.len(), p.slots)?;
         check_window_len(TABLE_WHAT, "inv", p.inv.len(), p.slots)?;
-        let max_tiles = route_tiles(p.slots, p.experts);
+        let max_tiles = route_tiles(p.slots, router.rows);
         check_window_len(
             TABLE_WHAT,
             "tiles",
             p.tiles.len(),
-            route_table_words(p.slots, p.experts),
+            route_table_words(p.slots, router.rows),
         )?;
         four_aligned(TABLE_WHAT, "tiles", p.tiles.byte_range()?.start.get())?;
         let args = args_bytes([
@@ -530,19 +543,38 @@ impl Kernels {
             .checked_mul(p.experts)
             .ok_or_else(|| refuse(format!("{} experts of {one} bytes wrap", p.experts)))?;
         let pair = p.kind == RoutedKind::Pair;
-        if pair != (p.stack_up.is_some() && p.shared_up.is_some()) {
+        let has_shared = self.geom.experts.has_shared;
+        if pair != p.stack_up.is_some() || p.shared_up.is_some() != (pair && p.shared.is_some()) {
             return Err(refuse(
-                "the pair takes the up's stack and shared tensor, the plain tile neither"
+                "the pair takes the up's stack, and the shared up when it has a shared expert; the plain tile takes neither"
                     .to_string(),
             ));
         }
+        match (p.shared.is_some(), has_shared) {
+            (true, true) | (false, false) => {}
+            (false, true) => {
+                return Err(refuse(
+                    "no shared expert, and the table has a shared group".to_string(),
+                ));
+            }
+            (true, false) => {
+                return Err(refuse(
+                    "a shared expert, and the table has no shared group".to_string(),
+                ));
+            }
+        }
         check_window_len(ROUTED_WHAT, "stack", p.stack.len(), stack_bytes)?;
-        check_window_len(ROUTED_WHAT, "shared", p.shared.len(), one)?;
-        let mut windows = vec![("stack", p.stack), ("shared", p.shared)];
-        if let (Some(up), Some(shared_up)) = (p.stack_up, p.shared_up) {
+        let mut windows = vec![("stack", p.stack)];
+        if let Some(shared) = p.shared {
+            check_window_len(ROUTED_WHAT, "shared", shared.len(), one)?;
+            windows.push(("shared", shared));
+        }
+        if let Some(up) = p.stack_up {
             check_window_len(ROUTED_WHAT, "up stack", up.len(), stack_bytes)?;
-            check_window_len(ROUTED_WHAT, "shared up", shared_up.len(), one)?;
             windows.push(("up stack", up));
+        }
+        if let Some(shared_up) = p.shared_up {
+            check_window_len(ROUTED_WHAT, "shared up", shared_up.len(), one)?;
             windows.push(("shared up", shared_up));
         }
         for (name, w) in &windows {
@@ -572,10 +604,13 @@ impl Kernels {
         let table = if pair { &family.pair } else { &family.plain };
         encoder.set_pipeline(&table[operand_at(p.operand)]);
         let mut slot = Bindings::new(encoder);
+        // An instance with no shared group binds the stack in the shared
+        // tensors' places, which the kernel does not read.
+        let shared = p.shared.as_ref().unwrap_or(&p.stack);
         slot.set(Binding::of(&p.stack)?)?;
         slot.set(Binding::of(p.stack_up.as_ref().unwrap_or(&p.stack))?)?;
-        slot.set(Binding::of(&p.shared)?)?;
-        slot.set(Binding::of(p.shared_up.as_ref().unwrap_or(&p.shared))?)?;
+        slot.set(Binding::of(shared)?)?;
+        slot.set(Binding::of(p.shared_up.as_ref().unwrap_or(shared))?)?;
         slot.set(Binding::of(&p.x)?)?;
         slot.set(Binding::of_mut(&p.y)?)?;
         slot.set(Binding::of(&p.tiles)?)?;
@@ -683,5 +718,56 @@ impl Kernels {
         slot.set(Binding::bytes(pack(&args))?)?;
         slot.set(p.fault.binding())?;
         slot.dispatch_groups(p.rows, delta.value_heads, delta.head_cols)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::geom::Geometry;
+    use crate::instance::REGISTERED;
+
+    /// The tiles of a table whose group `g` holds `counts[g]` slots.
+    fn tiles_of(counts: &[usize]) -> usize {
+        counts.iter().map(|n| n.div_ceil(ROUTE_TILE)).sum()
+    }
+
+    #[test]
+    fn the_table_bound_counts_the_groups_the_instance_has() {
+        for inst in REGISTERED {
+            let g = Geometry::of(inst);
+            let groups = g.router.experts + usize::from(g.experts.has_shared);
+            assert_eq!(
+                g.router.rows, groups,
+                "{}: the router's rows are the table's groups",
+                inst.name
+            );
+            for slots in [g.experts.slots, 1000 * g.experts.slots] {
+                assert_eq!(
+                    route_tiles(slots, g.router.rows),
+                    slots.div_ceil(ROUTE_TILE) + groups,
+                    "{}: {slots} slots, the slots' tiles and a partial tile a group",
+                    inst.name
+                );
+                assert_eq!(
+                    route_table_words(slots, g.router.rows),
+                    4 * (1 + route_tiles(slots, g.router.rows)),
+                    "{}: {slots} slots, a header entry and an entry a tile",
+                    inst.name
+                );
+            }
+            // The tables with the most tiles: one slot in every group, and a
+            // full tile and one more slot in every group.
+            let ones = vec![1; groups];
+            let over = vec![ROUTE_TILE + 1; groups];
+            for counts in [ones, over] {
+                let slots = counts.iter().sum();
+                assert!(
+                    tiles_of(&counts) <= route_tiles(slots, g.router.rows),
+                    "{}: {slots} slots over {groups} groups fit the bound",
+                    inst.name
+                );
+            }
+        }
     }
 }
