@@ -217,6 +217,18 @@ Its fresh4bin/8carrier canonical comparison again found all1657entries identical
 with non-JIT rows equal. Native formatting/Clippy passed (warning3=ratchet3); model557 and
 placement202 passed,0 failed,5 model tests ignored,0 filtered.
 
+The reviewed component source `7e37ef9a6ebbd766032ee521a0ee16e25f163851`
+executed the real CUDA mixed/empty-tier consumer on RTX3090 cc8.6:1 passed,
+0 failed/ignored,427 filtered,23.98s. Its metadata-only
+`a_dense_header_plans_through_qwen35_on` frontend consumer also passed1 case,
+including the named dense-header expert-tier refusal; that is not a second GPU case.
+The review code passed native formatting/all-target Clippy (warning3=ratchet3),
+chain23, GGUF67, model557 and placement202 (five model cases ignored,0 filtered).
+An exact-source7e37ef9a canonical comparison against main15778e2c found all1657
+entries identical across4bins/8carriers and non-JIT rows equal; it did not compare
+driver-JIT resource rows. The older full-library counts above remain historical,
+not a new full-library run of the review repairs or a run of this integration.
+
 The host-only planner covers one-byte boundaries before the first resident layer and another
 down form, plus descriptor overflow refusal. Neither this nor the component CUDA proof is a
 whole-model oracle or every affected model/residency gate; canonical equality does not waive
@@ -880,11 +892,12 @@ resource values must be measured, never inferred from an sm_86 build or cc8.6 ru
 
 ## 12. Shared-contract integration and same-input head probe — 2026-10-26
 
-The integrated contracts use main
-`15778e2cb2dd7af428d2dd14259e6b0ea8ca6b89`'s Rust1.99.1 and pinned
-cuda-oxide9df9e7ce / repository backend patch31ab6a1d3f58, not a model-specific
-compiler override. Older nightly/87bc arrays remain evidence of their own
-source and toolchain only.
+The integrated contracts started from main
+`15778e2cb2dd7af428d2dd14259e6b0ea8ca6b89` and were reconciled with pinned main
+`cb8d92ebddd1ce1a325a15450c06a01f57ecf88c`'s projection and stream interfaces.
+They retain Rust1.99.1 and cuda-oxide9df9e7ce / repository backend patch31ab6a1d3f58,
+not a model-specific compiler override. Older nightly/87bc arrays remain evidence
+of their own source and toolchain only.
 
 Current-main's prequantized leg input and metadata-only `Common` remain separate.
 Both ordinary and prequantized entry points retain the loaded `AmaxF16` protection state.
@@ -900,6 +913,16 @@ On RTX3090 cc8.6 / driver595.91.07, its protected-prequantized, mixed/empty-tier
 complete-GGUF consumers each passed one hardware case, zero failed/ignored. Its attention
 and router executables also exited0. These are source-specific results, not execution
 of later ownership/API repairs or whole-model oracle acceptance.
+
+The current-main code reconciliation at `49b11b36d4a1de2e140010c5a2d2c9afc3e2671a`
+passed native formatting/all-target Clippy (zero warning lines against ratchet three),
+model565 and placement206, with five model cases ignored and zero filtered.
+The common-name check found1337 lines against the existing1400-line allowance;
+all39 unsafe ownership rows matched their pins. These are host checks, not NVIDIA execution.
+The merge retains IQ4_XS's selected `_sel` dispatch on the supplied stream and its
+q8_1 launch accounting. The Qwen3.8 admission fixture accepts its projected sites while
+retaining the K=640 shared-down refusal. IQ4 activation bands were not relaxed,
+and the removed source-text wiring guard was not restored.
 
 ### Measured head/upstream separation, not a precision fix
 
