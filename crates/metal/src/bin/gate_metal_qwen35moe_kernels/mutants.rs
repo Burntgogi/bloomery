@@ -16,22 +16,227 @@
 //! check; a table that stayed green on one would be wrong.
 //!
 //! The tensor-op GEMMs' mutants ([`TENSOR_MUTANTS`]) edit their own program's
-//! text ([`TENSOR_SOURCE`]) and are caught by the `tensor_*` clauses, which
-//! run those kernels on any device that compiles them.
+//! text and are caught by the `tensor_*` clauses, which run those kernels on
+//! any device that compiles them.
 
 #[path = "../shared/mutants.rs"]
+#[allow(
+    dead_code,
+    reason = "the e2e gate reads the host shim `source_of`; this gate reads `source_at`"
+)]
 mod program;
 
-pub use program::{Mutant, Program, source_of};
+pub use program::{Mutant, Program, source_at};
 
-/// Every mutant of both tables, with the program it edits.
-pub fn all() -> impl Iterator<Item = (&'static Mutant, Program)> {
-    program::all(MUTANTS, TENSOR_MUTANTS)
+use super::Table;
+
+/// Every mutant of an instance's run (`table`, its row of the gate), with the
+/// program it edits: at an instance that runs the whole gate both tables; at
+/// one that runs its shaped kernels' clauses, the main table's mutants of
+/// those clauses and the instance's own.
+pub fn all(table: Table) -> Vec<(&'static Mutant, Program)> {
+    match table {
+        Table::Whole => program::all(MUTANTS, TENSOR_MUTANTS).collect(),
+        Table::Shaped { kept, own } => program::all(MUTANTS, &[])
+            .filter(|(m, _)| kept.contains(&m.name))
+            .chain(program::all(own, &[]))
+            .collect(),
+    }
 }
 
+/// The main table's mutants of the clauses the Qwen3-30B-A3B row runs, less
+/// those whose text its preprocessor removes or whose edit is the same
+/// program there: the gated epilogues (`attn_gate_s1`, `attn_gate_merge`),
+/// the shared slot (`pair_shared_stack`), the shared group of the grouped GEMM
+/// (`routed_shared_base`, `routed_shared_group_refused`), the picks' stride (`route_rows_per_row`), the
+/// logits' stride (`route_rows_stride`: the row's logits are dense, the stride
+/// its row count) and the key head swap (`prefill_kv_head`: four key heads
+/// make `1 - kv` wrap).
+pub const Q30_KEPT: &[&str] = &[
+    "router_logit",
+    "router_ids",
+    "router_tie",
+    "router_weights",
+    "router_ticket",
+    "router_nan",
+    "router_bounds",
+    "router_rounds",
+    "router_bad",
+    "router_norm_no_raise",
+    "pair_no_silu",
+    "pair_id_zero",
+    "pair_norm_gain",
+    "pair_norm_no_raise",
+    "fold_tail",
+    "fold_drop_weight",
+    "fold_no_resid",
+    "attn_score_scale",
+    "attn_q8_id",
+    "attn_key_count",
+    "attn_no_fold",
+    "attn_f16_round",
+    "attn_s1_partials",
+    "attn_half",
+    "attn_bounds",
+    "rows_rope_relative",
+    "rows_causal_plus1",
+    "rows_norm_shared",
+    "rows_norm_no_raise",
+    "rows_norm_plausible",
+    "prefill_causal_plus1",
+    "prefill_tile_relative",
+    "prefill_no_rescale",
+    "prefill_score_scale",
+    "prefill_overflow_no_raise",
+    "prefill_nan_plausible",
+    "route_table_duplicate",
+    "route_table_tile_cut",
+    "routed_expert_base",
+    "routed_no_weight",
+    "routed_silu_up",
+    "routed_no_gather",
+    "routed_dead_fragment",
+    "routed_range_off",
+    "routed_upper_rows",
+    "routed_last_row_unstaged",
+    "combine_skip_shared",
+    "gemm_f32w_rotate",
+];
+
+/// The defects only a head-128, ungated, unshared instance shows, and those of
+/// the clauses only its row runs: each edit is the same program at Qwen3.6's
+/// geometry, text its preprocessor removes there, or a defect of a clause
+/// that row alone has.
+pub const Q30_MUTANTS: &[Mutant] = &[
+    Mutant {
+        name: "attn_factors_tile_sized",
+        clause: "attn_f16",
+        why: "the shared block is the K and V tiles' size, so 32 heads' factors at 64 segments run past it",
+        edits: &[
+            (
+                "    (ATTN_TILE_WORDS > ATTN_FACTOR_WORDS ? ATTN_TILE_WORDS : ATTN_FACTOR_WORDS)",
+                "    (ATTN_TILE_WORDS)",
+                1,
+            ),
+            (
+                "static_assert(ATTN_SHARED_WORDS * 4u >= BLOOMERY_ATTN_Q * BLOOMERY_ATTN_SEGMENT_CAP * 2u,",
+                "static_assert(true,",
+                1,
+            ),
+        ],
+    },
+    Mutant {
+        name: "attn_norm_pair_32",
+        clause: "attn_f16",
+        why: "the norm's pair tree pairs dim t with t + 32, not with t + rot/2",
+        edits: &[(
+            "            i1 = tid + BLOOMERY_ATTN_ROT / 2u;",
+            "            i1 = tid + 32u;",
+            1,
+        )],
+    },
+    Mutant {
+        name: "router_shared_write_ungated",
+        clause: "router_ids",
+        why: "a router with no shared row still writes the shared slot's id and weight after the picks",
+        edits: &[(
+            "#if BLOOMERY_ROUTER_SHARED\n        ids[top_k] = ROUTER_EXPERTS;",
+            "#if 1\n        ids[top_k] = ROUTER_EXPERTS;",
+            1,
+        )],
+    },
+    Mutant {
+        name: "route_rows_per_row_shared",
+        clause: "route_rows_select",
+        why: "a row's ids and weights are written at the picks' stride and a shared slot's, which the router has none of",
+        edits: &[(
+            "const uint per_row = args.top_k + BLOOMERY_ROUTER_SHARED;",
+            "const uint per_row = args.top_k + 1u;",
+            1,
+        )],
+    },
+    Mutant {
+        name: "route_table_shared_slot",
+        clause: "route_table",
+        why: "the last slot of every row is taken for a shared expert's, which the instance has none of",
+        edits: &[(
+            "const bool shared = BLOOMERY_ROUTER_SHARED && (s % args.per_row) == args.per_row - 1u;",
+            "const bool shared = 1 && (s % args.per_row) == args.per_row - 1u;",
+            2,
+        )],
+    },
+    Mutant {
+        name: "combine_shared_term",
+        clause: "combine",
+        why: "the combine sums one slot more than the picks, a shared expert's term the instance has none of",
+        edits: &[(
+            "for (uint s = 0u; s < args.per_row; ++s) {",
+            "for (uint s = 0u; s < BLOOMERY_EXPERT_ROUTED + 1u; ++s) {",
+            1,
+        )],
+    },
+    Mutant {
+        name: "routed_q6_offset",
+        clause: "grouped_q6_down",
+        why: "the Q6_K down of the grouped GEMM is centred on 31, not 32, so every weight is off by one scale step",
+        edits: &[(
+            "const float offset = -32.f * dsc;",
+            "const float offset = -31.f * dsc;",
+            1,
+        )],
+    },
+    Mutant {
+        name: "prefill_kv_head_reversed",
+        clause: "attn_prefill",
+        why: "the prefill reads the mirrored key head's rows for its query heads",
+        edits: &[(
+            "ulong at = ((ulong)kv * args.ctx + key) * PF_ROW_WORDS + c;",
+            "ulong at = ((ulong)(BLOOMERY_ATTN_KV - 1u - kv) * args.ctx + key) * PF_ROW_WORDS + c;",
+            1,
+        )],
+    },
+    Mutant {
+        name: "attn_gate_ungated",
+        clause: "attn_f16",
+        why: "a query with no gate still multiplies the attention by the sigmoid of the value past its head",
+        edits: &[(
+            "#if BLOOMERY_ATTN_GATED\n            float g = q[head * BLOOMERY_ATTN_QG + BLOOMERY_ATTN_HEAD + dim0 + d];",
+            "#if 1\n            float g = q[head * BLOOMERY_ATTN_QG + BLOOMERY_ATTN_HEAD + dim0 + d];",
+            1,
+        )],
+    },
+    Mutant {
+        name: "routed_group_past_routed_open",
+        clause: "grouped_q6_down",
+        why: "a tile of the group one past the routed experts passes the expert-id check on an instance with no shared expert and reads one expert past the stack",
+        edits: &[(
+            "expert >= args.n_experts + BLOOMERY_ROUTER_SHARED",
+            "expert > args.n_experts",
+            1,
+        )],
+    },
+    Mutant {
+        name: "routed_group_past_routed_shared",
+        clause: "grouped_q6_down",
+        why: "a tile of the group one past the routed experts is taken for the shared expert's on an instance with none: it raises no expert-id site and reads the stack's first expert",
+        edits: &[
+            (
+                "expert >= args.n_experts + BLOOMERY_ROUTER_SHARED",
+                "expert > args.n_experts",
+                1,
+            ),
+            (
+                "const bool shared = BLOOMERY_ROUTER_SHARED != 0 && expert == args.n_experts;",
+                "const bool shared = expert == args.n_experts;",
+                1,
+            ),
+        ],
+    },
+];
+
 /// The mutant of this name, and the program it edits.
-pub fn find(name: &str) -> Option<(&'static Mutant, Program)> {
-    all().find(|(m, _)| m.name == name)
+pub fn find(name: &str, table: Table) -> Option<(&'static Mutant, Program)> {
+    all(table).into_iter().find(|(m, _)| m.name == name)
 }
 
 const TAIL_STORE_FIND: &str =
@@ -769,8 +974,8 @@ pub const MUTANTS: &[Mutant] = &[
         clause: "attn_prefill",
         why: "the prefill reads the other key head's rows for its query heads",
         edits: &[(
-            "ulong at = ((ulong)kv * args.ctx + key) * (BLOOMERY_ATTN_HEAD / 8u) + c;",
-            "ulong at = ((ulong)(1u - kv) * args.ctx + key) * (BLOOMERY_ATTN_HEAD / 8u) + c;",
+            "ulong at = ((ulong)kv * args.ctx + key) * PF_ROW_WORDS + c;",
+            "ulong at = ((ulong)(1u - kv) * args.ctx + key) * PF_ROW_WORDS + c;",
             1,
         )],
     },
@@ -947,7 +1152,7 @@ pub const MUTANTS: &[Mutant] = &[
         clause: "route_rows_select",
         why: "a row's ids and weights are written at the picks' stride, not the picks and the shared slot's",
         edits: &[(
-            "const uint per_row = args.top_k + 1u;",
+            "const uint per_row = args.top_k + BLOOMERY_ROUTER_SHARED;",
             "const uint per_row = args.top_k;",
             1,
         )],
@@ -987,6 +1192,16 @@ pub const MUTANTS: &[Mutant] = &[
         clause: "grouped_gemm",
         why: "the shared group reads the stack's first expert, not the shared tensors",
         edits: &[("shared ? W_sh : W +", "shared ? W : W +", 1)],
+    },
+    Mutant {
+        name: "routed_shared_group_refused",
+        clause: "q8_0_grouped",
+        why: "the group past the routed experts is refused as a tile the table cannot write, though the instance has a shared expert",
+        edits: &[(
+            "expert >= args.n_experts + BLOOMERY_ROUTER_SHARED",
+            "expert >= args.n_experts",
+            1,
+        )],
     },
     Mutant {
         name: "routed_no_weight",
@@ -1457,6 +1672,16 @@ pub const TENSOR_MUTANTS: &[Mutant] = &[
         edits: &[(
             "blk.scales + ((s >> 1) & 1), sc16);",
             "blk.scales + ((s >> 2) & 1), sc16);",
+            1,
+        )],
+    },
+    Mutant {
+        name: "tensor_routed_shared_group_refused",
+        clause: "tensor_q8_0_grouped",
+        why: "the group past the routed experts is refused as a tile the table cannot write, though the instance has a shared expert",
+        edits: &[(
+            "expert >= args.n_experts + BLOOMERY_ROUTER_SHARED",
+            "expert >= args.n_experts",
             1,
         )],
     },
