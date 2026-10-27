@@ -3773,7 +3773,7 @@ mod tests {
                 assert_eq!(got.len(), 1, "{name} {ty}: {got:?}");
             }
         }
-        // The shared expert's down is K = 640: a K-quant's rows are whole
+        // The shared expert's down is K = 640: the q8_1 types' rows are whole
         // super-blocks of 256, so only the f32-row types read it, and a type
         // no dense entry reads is refused by both pins.
         let down = "ffn_down_shexp.weight";

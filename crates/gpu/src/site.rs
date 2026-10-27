@@ -235,13 +235,14 @@ pub(crate) const BY_NAME: [SiteTy; 5] = [
 
 /// The types a dense site launches by name through [`ByName`] over up to
 /// [`BY_NAME_COLS`] columns: [`BY_NAME`] and the families that read the q8_1
-/// blocks of 128 (the K-quants, NVFP4), every dense family but Q5_0. A unit
+/// blocks of 128 (the K-quants, IQ4_XS, NVFP4), every dense family but Q5_0. A unit
 /// test holds the list to `placement::accepts::dense_projected`.
-pub(crate) const PROJECTED: [SiteTy; 10] = [
+pub(crate) const PROJECTED: [SiteTy; 11] = [
     SiteTy::Q3K,
     SiteTy::Q4K,
     SiteTy::Q5K,
     SiteTy::Q6K,
+    SiteTy::Iq4Xs,
     SiteTy::Q8_0,
     SiteTy::F32,
     SiteTy::Nvfp4,
@@ -772,8 +773,8 @@ pub fn blocks32_gemv(
 pub const BY_NAME_COLS: usize = KGEMV_COLS;
 
 /// The launches a [`ByName::gemv`] of a whole weight of type `ty` over `m`
-/// columns makes beyond the one an f32-row site makes: a K-quant or NVFP4
-/// site quantizes its columns into q8_1 rows first, and a type whose gemv is
+/// columns makes beyond the one an f32-row site makes: a K-quant, IQ4_XS or
+/// NVFP4 site quantizes its columns into q8_1 rows first, and a type whose gemv is
 /// row-major ([`kgemv_order`]) copies its result token-major past one column.
 /// A body counts its captured walk's launches by this and the weights'
 /// resident types.
@@ -906,8 +907,8 @@ impl ByName {
     /// `out = W · x` for the resident weight `name`, by the site type of its
     /// resident form, over the first `m` (1..=[`BY_NAME_COLS`]) columns of
     /// the f32 rows `x`; a fault of the quantization raises into layer
-    /// `layer`'s sink. `k` is read only by a K-quant or NVFP4 site, `g32` by
-    /// an F32 site past one column ([`resident_gemv_cols`]). A Q5_0 site, a
+    /// `layer`'s sink. `k` is read only by a K-quant, IQ4_XS or NVFP4 site, `g32`
+    /// by an F32 site past one column ([`resident_gemv_cols`]). A Q5_0 site, a
     /// form the load made no q8_1 rows for, or a part past the output's
     /// stride is refused by name.
     #[allow(
@@ -2034,8 +2035,8 @@ mod tests {
 
     /// A by-name projection's extra launches follow the type: none for a site
     /// that reads the f32 rows or the q8 blocks of 32, the quantization for a
-    /// K-quant, IQ4_XS or NVFP4 site, and the token-major copy past one column for
-    /// the row-major types alone (Q3_K, Q4_K, Q6_K).
+    /// K-quant, IQ4_XS or NVFP4 site, and the token-major copy past one
+    /// column for the row-major types alone (Q3_K, Q4_K, Q6_K).
     #[test]
     fn a_by_name_projection_counts_its_quantization_and_its_row_major_copy() {
         for (ty, one, rows) in [
@@ -2099,7 +2100,7 @@ mod tests {
             );
         }
         assert_eq!(
-            file_site(&file, "test", "shared", (2, 256), SiteTy::ALL).ok(),
+            file_site(&file, "test", "shared", (2, 256), &super::PROJECTED).ok(),
             Some(SiteTy::Iq4Xs)
         );
         for (name, shape, allowed) in [
