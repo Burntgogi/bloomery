@@ -138,12 +138,9 @@ IQ4_XS, and selected dispatch uses the supplied stream. Projected attention/shar
 sites are admitted; the K=640 shared down and unsupported types/shapes remain refused.
 This reuses the existing program and kernel, not a new model implementation.
 
-At source `b0fc05e5349330927ceb33ce6f30e584f25ecf4d`, the typed GGUF
-`iq4_sites_keep_shape_and_launch_admission_separate` consumer passed1 case,
-0 failed/ignored,430 filtered. Its successful arm uses `PROJECTED`, not merely
-`ALL`; this checks actual file admission rather than copying a metadata registry.
-The case is metadata-only and creates no CUDA context; oxide owns its linking.
-It is not fresh NVIDIA execution of the current-main stream/launch paths.
+The typed GGUF test `a_site_type_comes_from_the_header_and_a_type_with_no_launch_is_refused`
+reads an IQ4_XS shared site through `PROJECTED`, not merely `ALL`. It refuses IQ3_S, another
+shape and a type outside the allowed list by name. It is metadata-only and creates no CUDA context.
 
 Pinned upstream `95a483fc242d00dec7987efe4a05e24b5f651c1f` subsequently adds the
 split gate/up path that materializes f32 SwiGLU for a down that reads f32.
