@@ -278,7 +278,7 @@ pub const fn dense_by_name(ty: GgmlType) -> Option<SiteEntry> {
 
 /// The dense sites launched by name over up to eight columns on every family
 /// the table's dense row names but Q5_0 (`site::ByName`): the f32-row entries
-/// beside those that read q8_1 blocks of 128 (the K-quants, NVFP4), whose
+/// beside those that read q8_1 blocks of 128 (the K-quants, IQ4_XS, NVFP4), whose
 /// activation the unit quantizes itself. Q5_0 reads 32-value blocks no
 /// by-name unit holds.
 #[must_use]

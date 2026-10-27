@@ -3602,8 +3602,8 @@ mod tests {
     // PIN(2026-10-26): the K-quants (Q3_K to Q6_K) joined the dense sites' set: both walks project a site by name
     // (`site::ByName`), the q8_1 quantization and the K-quant gemv by chunks on the ubatch walk. The shared expert's
     // down keeps the f32-row types: K = 640 is not whole super-blocks.
-    // IQ4_XS sites likewise read q8_1 through the selected one-expert dispatch; the shared down
-    // still refuses them because its K = 640 is not whole super-blocks.
+    // PIN(2026-10-27): IQ4_XS moved from refused to q8_1; it reads q8_1 through the selected one-expert dispatch,
+    // and the shared down still refuses it because its K = 640 is not whole super-blocks.
     #[test]
     fn the_qwen38_dense_pins_read_the_projected_sites() {
         let q8_1 = [
@@ -3627,13 +3627,21 @@ mod tests {
             GgmlType::IQ4_NL,
             GgmlType::Q4_0,
         ];
-        for (name, role) in [
-            ("attn_q.weight", Role::Attention),
-            ("ssm_out.weight", Role::Attention),
-            ("indexer.q_proj.weight", Role::Attention),
-            ("indexer.k_proj.weight", Role::Attention),
-            ("ffn_gate_shexp.weight", Role::SharedExpert),
-            ("ffn_up_shexp.weight", Role::SharedExpert),
+        for (name, role, what) in [
+            ("attn_q.weight", Role::Attention, "attention matrices"),
+            ("ssm_out.weight", Role::Attention, "attention matrices"),
+            (
+                "indexer.q_proj.weight",
+                Role::Attention,
+                "attention matrices",
+            ),
+            (
+                "indexer.k_proj.weight",
+                Role::Attention,
+                "attention matrices",
+            ),
+            ("ffn_gate_shexp.weight", Role::SharedExpert, "shared expert"),
+            ("ffn_up_shexp.weight", Role::SharedExpert, "shared expert"),
         ] {
             for ty in q8_1.into_iter().chain(f32_rows) {
                 let got = items(Program::Qwen38Body, &matrix(name, role, ty));
@@ -3642,6 +3650,7 @@ mod tests {
             for ty in refused {
                 let got = items(Program::Qwen38Body, &matrix(name, role, ty));
                 assert_eq!(got.len(), 1, "{name} {ty}: {got:?}");
+                assert!(got[0].starts_with(&format!("{ty} {what}")), "{got:?}");
             }
         }
         // The shared expert's down is K = 640: the q8_1 types' rows are whole
@@ -3655,6 +3664,10 @@ mod tests {
         for ty in q8_1 {
             let got = items(Program::Qwen38Body, &matrix(down, Role::SharedExpert, ty));
             assert_eq!(got.len(), 1, "{down} {ty}: {got:?}");
+            assert!(
+                got[0].starts_with(&format!("{ty} shared expert down (K = 640")),
+                "{got:?}"
+            );
         }
         for ty in refused {
             let got = items(Program::Qwen38Body, &matrix(down, Role::SharedExpert, ty));
