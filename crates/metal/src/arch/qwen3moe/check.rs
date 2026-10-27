@@ -22,7 +22,7 @@
 use bloomery_device::fault::FAULT_WORDS;
 use chain::ChainError;
 use chain::arch::qwen3moe::plan::{
-    DeltaPlan, FfnRoute, GqaPlan, Kind35, LayerPlan, MixerPlan, SharedPlan, SiteTy, kinds35,
+    DeltaPlan, FfnRoute, GqaPlan, Kind35, LayerPlan, MixerPlan, SharedPlan, SiteTy, kinds_of,
 };
 use chain::arch::qwen3moe::read::{
     PlanDims, Read35, Sites35, file_names, plan_delta, plan_ffn, plan_gqa,
@@ -38,11 +38,9 @@ use model::arch::names;
 use super::arena::LANES;
 use super::rows::RowsLens;
 use super::session::{LAUNCHED, SITES, SessionError, WHAT, pass_rows_max};
-use crate::kernels::{
-    CONV_TAPS, EXPERT_K, EXPERT_SLOTS, HEAD_COLS, HEAD_DIM, HEAD_K, HeadMap, KV_HEADS,
-    MAX_SEGMENTS, PARTIALS_PER_HEAD, Quant, ROT, ROUTED_IDS, VALUE_HEADS, channels, f16_len,
-    head_groups, out_len, partials_len, qg_len, ring_elems, router, segments_for_keys, state_elems,
-};
+use crate::geom::Geometry;
+use crate::instance::{self, Instance};
+use crate::kernels::{HeadMap, MAX_SEGMENTS, Quant, head_groups, segments_for_keys};
 
 /// The arena's name in a refusal.
 const ARENA: &str = "qwen35moe arena";
@@ -122,9 +120,10 @@ impl At<'_> {
 }
 
 /// The header's view of the tensors: a name's type and shape, judged by the
-/// arena's rules.
+/// arena's rules at the launch geometry `geom` of the file's instance.
 struct Table<'a> {
     split: &'a Split,
+    geom: &'a Geometry,
 }
 
 impl Table<'_> {
@@ -289,15 +288,22 @@ pub(super) enum MixerLayout {
 pub(super) struct FfnLayout {
     pub(super) norm: Values,
     pub(super) gate_inp: Values,
-    pub(super) gate_inp_shexp: Values,
     pub(super) gate_up_quant: Quant,
     pub(super) gate: Site,
     pub(super) up: Site,
-    pub(super) shexp_gate: Site,
-    pub(super) shexp_up: Site,
     pub(super) down_quant: Quant,
     pub(super) down: Site,
-    pub(super) shexp_down: Site,
+    /// The shared expert, on a router that runs one.
+    pub(super) shared: Option<SharedLayout>,
+}
+
+/// A shared expert: its router row and its three sites, each of its routed
+/// stack's type.
+pub(super) struct SharedLayout {
+    pub(super) gate_inp: Values,
+    pub(super) gate: Site,
+    pub(super) up: Site,
+    pub(super) down: Site,
 }
 
 pub(super) struct LayerLayout {
@@ -327,8 +333,13 @@ pub(super) struct Layout {
     pub(super) proj: usize,
 }
 
-/// A file the open runs: the plans of its layers and the arena's layout.
+/// A file the open runs: the instance its shape selects and that instance's
+/// launch geometry (every arena rule below was judged at it, and the arena and
+/// the launches are sized by it), the plans of its layers and the arena's
+/// layout.
 pub struct Checked {
+    pub(super) instance: &'static Instance,
+    pub(super) geom: Geometry,
     pub(super) plans: Vec<LayerPlan>,
     pub(super) layout: Layout,
 }
@@ -545,7 +556,7 @@ fn read(
         .expect("a split holds a first shard")
         .display()
         .to_string();
-    let spec = match model::arch::qwen35moe::spec::read(split) {
+    let spec = match model::arch::spec(split) {
         Ok(read) => read.spec,
         Err(e) => {
             At {
@@ -557,8 +568,18 @@ fn read(
         }
     };
     *summary = Some(summarize(split, &spec));
-    let (kinds, pd) = match kinds35(&spec.layers)
-        .and_then(|kinds| PlanDims::q35(&spec, WHAT).map(|pd| (kinds, pd)))
+    // The library a session of the file runs on: the instance its shape
+    // selects, a shape no instance is built for refused by name. The arena's
+    // rules below are judged at the instance's launch geometry, so a shape
+    // with no instance has none of them: its plans are read, and no more.
+    let inst = At {
+        items: &mut *items,
+        layer: None,
+    }
+    .ok(instance::select(&spec).map_err(|e| super::session::refuse(format!("{path}: {e}"))));
+    let geom = inst.map(Geometry::of);
+    let (kinds, pd) = match kinds_of(&spec.layers)
+        .and_then(|kinds| PlanDims::of(&spec, WHAT).map(|pd| (kinds, pd)))
     {
         Ok(read) => read,
         Err(e) => {
@@ -584,27 +605,29 @@ fn read(
         );
         plans.push(mixer.zip(ffn).map(|(mixer, ffn)| LayerPlan { mixer, ffn }));
     }
-    let table = Table { split };
-    let head = head_checks(
-        &mut At {
-            items: &mut *items,
-            layer: None,
-        },
-        &table,
-        &spec,
-        ctx,
-    );
+    let table = geom.as_ref().map(|geom| Table { split, geom });
+    let head = table.as_ref().and_then(|table| {
+        head_checks(
+            &mut At {
+                items: &mut *items,
+                layer: None,
+            },
+            table,
+            &spec,
+            ctx,
+        )
+    });
     let mut shared = SharedShapes::default();
     let hidden = spec.hidden as usize;
     let mut layouts: Vec<Option<LayerLayout>> = Vec::with_capacity(plans.len());
     for (l, (plan, layer)) in plans.iter().zip(&spec.layers).enumerate() {
-        layouts.push(plan.as_ref().and_then(|plan| {
+        layouts.push(plan.as_ref().zip(table.as_ref()).and_then(|(plan, table)| {
             layer_checks(
                 &mut At {
                     items: &mut *items,
                     layer: Some(l),
                 },
-                &table,
+                table,
                 plan,
                 layer,
                 hidden,
@@ -632,7 +655,8 @@ fn read(
         })
         .flatten()
         .and_then(|base| {
-            file.ok(RopeTable::new(&RopeSpec::window(base, ROT))
+            let rot = geom?.attn.rot;
+            file.ok(RopeTable::new(&RopeSpec::window(base, rot))
                 .map_err(|e| refuse(format!("the rope table: {e}"))))
         });
     let layers: Option<Vec<LayerLayout>> = layouts.into_iter().collect();
@@ -647,11 +671,19 @@ fn read(
             .max()
             .ok_or_else(|| refuse("a file of no layer")))
     });
-    let attn_out = file.ok(out_len().ok_or_else(|| refuse("the attention output does not fit")));
+    let attn_out = geom.and_then(|g| {
+        file.ok(g
+            .attn
+            .out_len()
+            .ok_or_else(|| refuse("the attention output does not fit")))
+    });
     let plans: Option<Vec<LayerPlan>> = plans.into_iter().collect();
-    let (head, (n_experts, top_k), rope, layers, proj, attn_out, plans) =
-        (head?, moe?, rope?, layers?, proj?, attn_out?, plans?);
+    let (inst, geom, head, (n_experts, top_k), rope, layers, proj, attn_out, plans) = (
+        inst?, geom?, head?, moe?, rope?, layers?, proj?, attn_out?, plans?,
+    );
     Some(Checked {
+        instance: inst,
+        geom,
         plans,
         layout: Layout {
             hidden,
@@ -684,9 +716,9 @@ struct HeadChecks {
 }
 
 /// The cache's rows and the lengths of them every buffer past the layers
-/// holds: `ctx` within the file's trained context, and every length of it
-/// fits.
-fn cache_lens(ctx: usize, trained: usize) -> Result<(usize, usize), SessionError> {
+/// holds at `g`: `ctx` within the file's trained context, and every length of
+/// it fits.
+fn cache_lens(g: &Geometry, ctx: usize, trained: usize) -> Result<(usize, usize), SessionError> {
     if ctx == 0 {
         return Err(refuse(format!(
             "a cache of {ctx} rows; a session holds at least one"
@@ -699,13 +731,15 @@ fn cache_lens(ctx: usize, trained: usize) -> Result<(usize, usize), SessionError
     }
     let word = u32::try_from(ctx)
         .map_err(|_| refuse(format!("a cache of {ctx} rows does not fit u32")))?;
-    let _ =
-        f16_len(ctx).ok_or_else(|| refuse(format!("the f16 cache of {ctx} rows does not fit")))?;
+    let _ = g
+        .attn
+        .f16_len(ctx)
+        .ok_or_else(|| refuse(format!("the f16 cache of {ctx} rows does not fit")))?;
     let rope_len = ctx
-        .checked_mul(ROT)
+        .checked_mul(g.attn.rot)
         .ok_or_else(|| refuse(format!("the rope table of {ctx} rows does not fit")))?;
     let segments = segments_for_keys(word) as usize;
-    let attn_partials = partials_len(segments).ok_or_else(|| {
+    let attn_partials = g.attn.partials_len(segments).ok_or_else(|| {
         refuse(format!(
             "the attention partials of {segments} segments do not fit"
         ))
@@ -715,13 +749,14 @@ fn cache_lens(ctx: usize, trained: usize) -> Result<(usize, usize), SessionError
 
 /// The cache, the hidden width, the vocabulary, the embedding and the head.
 fn head_checks(at: &mut At<'_>, t: &Table<'_>, spec: &ModelSpec, ctx: usize) -> Option<HeadChecks> {
-    let lens = at.ok(cache_lens(ctx, spec.ctx_train as usize));
+    let lens = at.ok(cache_lens(t.geom, ctx, spec.ctx_train as usize));
     let hidden = spec.hidden as usize;
     let vocab = spec.vocab as usize;
     let mut ok = true;
-    if hidden != HEAD_K || hidden != router::K {
+    if hidden != t.geom.hidden {
         at.push(refuse(format!(
-            "a hidden width of {hidden}; the head and the router read {HEAD_K}"
+            "a hidden width of {hidden}; the router reads {}",
+            t.geom.hidden
         )));
         ok = false;
     }
@@ -842,17 +877,19 @@ fn delta_checks(
     hidden: usize,
 ) -> Option<DeltaLayout> {
     let LinearShape { n_k, n_v, map } = d.shape;
-    if n_v != VALUE_HEADS {
+    let g = &t.geom.delta;
+    if n_v != g.value_heads {
         at.push(refuse(format!(
-            "{n_v} value heads; the delta step runs {VALUE_HEADS}"
+            "{n_v} value heads; the delta step runs {}",
+            g.value_heads
         )));
         return None;
     }
-    let Some(ch) = channels(n_k) else {
+    let Some(ch) = g.channels(n_k) else {
         at.push(refuse(format!("{n_k} key heads do not fit")));
         return None;
     };
-    let z_len = VALUE_HEADS * HEAD_COLS;
+    let z_len = g.value_heads * g.head_cols;
     let p1 = p1_checks(
         at,
         t,
@@ -860,8 +897,8 @@ fn delta_checks(
         &[
             (&d.qkv, ch),
             (&d.gate, z_len),
-            (&d.beta, VALUE_HEADS),
-            (&d.alpha, VALUE_HEADS),
+            (&d.beta, g.value_heads),
+            (&d.alpha, g.value_heads),
         ],
         hidden,
     );
@@ -875,12 +912,16 @@ fn delta_checks(
         }
         fits
     });
-    let state = at.ok(state_elems(LANES).ok_or_else(|| refuse("the delta state does not fit")));
-    let ring = at.ok(ring_elems(n_k).ok_or_else(|| refuse("the conv ring does not fit")));
-    let conv = at.ok(t.f32s(&d.conv, CONV_TAPS * ch));
-    let dt_bias = at.ok(t.f32s(&d.dt_bias, VALUE_HEADS));
-    let ssm_a = at.ok(t.f32s(&d.ssm_a, VALUE_HEADS));
-    let ssm_norm = at.ok(t.f32s(&d.ssm_norm, HEAD_COLS));
+    let state = at.ok(g
+        .state_elems(LANES)
+        .ok_or_else(|| refuse("the delta state does not fit")));
+    let ring = at.ok(g
+        .ring_elems(n_k)
+        .ok_or_else(|| refuse("the conv ring does not fit")));
+    let conv = at.ok(t.f32s(&d.conv, g.conv_taps * ch));
+    let dt_bias = at.ok(t.f32s(&d.dt_bias, g.value_heads));
+    let ssm_a = at.ok(t.f32s(&d.ssm_a, g.value_heads));
+    let ssm_norm = at.ok(t.f32s(&d.ssm_norm, g.head_cols));
     Some(DeltaLayout {
         p1: p1?,
         out: out?,
@@ -905,8 +946,11 @@ fn attention_checks(
     hidden: usize,
     ctx: usize,
 ) -> Option<AttnLayout> {
-    let q_rows = at.ok(qg_len().ok_or_else(|| refuse("the query rows do not fit")));
-    let kv_rows = KV_HEADS * HEAD_DIM;
+    let a = &t.geom.attn;
+    let q_rows = at.ok(a
+        .qg_len()
+        .ok_or_else(|| refuse("the query rows do not fit")));
+    let kv_rows = a.kv_heads * a.head;
     let p1 = q_rows.and_then(|q_rows| {
         p1_checks(
             at,
@@ -920,11 +964,15 @@ fn attention_checks(
             hidden,
         )
     });
-    let att = at.ok(out_len().ok_or_else(|| refuse("the attention rows do not fit")));
+    let att = at.ok(a
+        .out_len()
+        .ok_or_else(|| refuse("the attention rows do not fit")));
     let out = att.and_then(|att| at.ok(t.site(&g.attn_output, att, hidden)));
-    let cache = at.ok(f16_len(ctx).ok_or_else(|| refuse("the cache does not fit")));
-    let q_norm = at.ok(t.f32s(&g.attn_q_norm, HEAD_DIM));
-    let k_norm = at.ok(t.f32s(&g.attn_k_norm, HEAD_DIM));
+    let cache = at.ok(a
+        .f16_len(ctx)
+        .ok_or_else(|| refuse("the cache does not fit")));
+    let q_norm = at.ok(t.f32s(&g.attn_q_norm, a.head));
+    let k_norm = at.ok(t.f32s(&g.attn_k_norm, a.head));
     Some(AttnLayout {
         p1: p1?,
         out: out?,
@@ -942,11 +990,11 @@ fn ffn_checks(
     (n_experts, top_k): (usize, usize),
     l: usize,
 ) -> Option<FfnLayout> {
-    match &plan.ffn.route {
+    let joined = match &plan.ffn.route {
         FfnRoute::Router {
             shared: Some(SharedPlan::Joined),
             ..
-        } => {}
+        } => true,
         FfnRoute::Router {
             shared: Some(SharedPlan::Apart(_)),
             ..
@@ -956,24 +1004,28 @@ fn ffn_checks(
             ));
             return None;
         }
-        FfnRoute::Router { shared: None, .. } => {
-            at.push(refuse(
-                "a router with no shared expert, which the router does not run",
-            ));
-            return None;
-        }
+        FfnRoute::Router { shared: None, .. } => false,
         FfnRoute::Dense => {
             at.push(refuse(
                 "a dense FFN, which this backend's experts do not run",
             ));
             return None;
         }
+    };
+    let (router, experts) = (&t.geom.router, &t.geom.experts);
+    if joined != (router.shared == 1) {
+        at.push(refuse(if joined {
+            "a shared expert, which the instance's router and experts run none of"
+        } else {
+            "a router with no shared expert, and the instance's router runs one"
+        }));
+        return None;
     }
-    if n_experts != router::EXPERTS || top_k != ROUTED_IDS {
+    if n_experts != router.experts || top_k != experts.routed_ids {
         at.push(refuse(format!(
             "{n_experts} experts picking {top_k}; the router and the experts run \
-             {} picking {ROUTED_IDS}",
-            router::EXPERTS
+             {} picking {}",
+            router.experts, experts.routed_ids
         )));
         return None;
     }
@@ -981,23 +1033,33 @@ fn ffn_checks(
     // of the naming): the plan names the joined stacks, which this backend
     // reads as the routed stack and the shared expert apart.
     let file = file_names(l);
-    let gate = at.ok(t.site(&file.gate, hidden, EXPERT_K * n_experts));
-    let up = at.ok(t.site(&file.up, hidden, EXPERT_K * n_experts));
-    let shexp_gate = at.ok(t.site(&file.sh_gate, hidden, EXPERT_K));
-    let shexp_up = at.ok(t.site(&file.sh_up, hidden, EXPERT_K));
+    let gate = at.ok(t.site(&file.gate, hidden, experts.k * n_experts));
+    let up = at.ok(t.site(&file.up, hidden, experts.k * n_experts));
+    let shexp_gate = joined.then(|| at.ok(t.site(&file.sh_gate, hidden, experts.k)));
+    let shexp_up = joined.then(|| at.ok(t.site(&file.sh_up, hidden, experts.k)));
     let mut ok = true;
-    if let (Some(g), Some(u), Some(sg), Some(su)) = (&gate, &up, &shexp_gate, &shexp_up)
-        && [u.quant, sg.quant, su.quant].iter().any(|&q| q != g.quant)
-    {
-        at.push(refuse(format!(
-            "gate {:?}, up {:?}, shared gate {:?}, shared up {:?}; the pair runs one type",
-            g.quant, u.quant, sg.quant, su.quant
-        )));
-        ok = false;
+    match (&gate, &up, &shexp_gate, &shexp_up) {
+        (Some(g), Some(u), Some(Some(sg)), Some(Some(su)))
+            if [u.quant, sg.quant, su.quant].iter().any(|&q| q != g.quant) =>
+        {
+            at.push(refuse(format!(
+                "gate {:?}, up {:?}, shared gate {:?}, shared up {:?}; the pair runs one type",
+                g.quant, u.quant, sg.quant, su.quant
+            )));
+            ok = false;
+        }
+        (Some(g), Some(u), None, None) if u.quant != g.quant => {
+            at.push(refuse(format!(
+                "gate {:?}, up {:?}; the pair runs one type",
+                g.quant, u.quant
+            )));
+            ok = false;
+        }
+        _ => {}
     }
-    let down = at.ok(t.site(&file.down, EXPERT_K, hidden * n_experts));
-    let shexp_down = at.ok(t.site(&file.sh_down, EXPERT_K, hidden));
-    if let (Some(d), Some(sd)) = (&down, &shexp_down)
+    let down = at.ok(t.site(&file.down, experts.k, hidden * n_experts));
+    let shexp_down = joined.then(|| at.ok(t.site(&file.sh_down, experts.k, hidden)));
+    if let (Some(d), Some(Some(sd))) = (&down, &shexp_down)
         && sd.quant != d.quant
     {
         at.push(refuse(format!(
@@ -1010,21 +1072,26 @@ fn ffn_checks(
     // The router and the shared-expert gate: F32 in a GGUF file, MLX's
     // affine 8-bit in an MLX file, dequantized exactly at open.
     let gate_inp = at.ok(t.f32s_or_a8(&file.router, n_experts * hidden));
-    let gate_inp_shexp = at.ok(t.f32s_or_a8(&file.router_gate, hidden));
-    let (gate, up, shexp_gate, shexp_up, down, shexp_down) =
-        (gate?, up?, shexp_gate?, shexp_up?, down?, shexp_down?);
+    let gate_inp_shexp = joined.then(|| at.ok(t.f32s_or_a8(&file.router_gate, hidden)));
+    let shared = match (gate_inp_shexp, shexp_gate, shexp_up, shexp_down) {
+        (Some(gate_inp), Some(gate), Some(up), Some(down)) => Some(SharedLayout {
+            gate_inp: gate_inp?,
+            gate: gate?,
+            up: up?,
+            down: down?,
+        }),
+        _ => None,
+    };
+    let (gate, up, down) = (gate?, up?, down?);
     ok.then_some(FfnLayout {
         norm: norm?,
         gate_inp: gate_inp?,
-        gate_inp_shexp: gate_inp_shexp?,
         gate_up_quant: gate.quant,
         down_quant: down.quant,
         gate,
         up,
-        shexp_gate,
-        shexp_up,
         down,
-        shexp_down,
+        shared,
     })
 }
 
@@ -1047,10 +1114,10 @@ fn layer_checks(
         }
         (MixerPlan::Gqa(g), SpecMixer::Gqa(spec_g)) => {
             let mut ok = true;
-            if spec_g.rope.dims as usize != ROT {
+            if spec_g.rope.dims as usize != t.geom.attn.rot {
                 at.push(refuse(format!(
-                    "a rope over {} values; the attention turns {ROT}",
-                    spec_g.rope.dims
+                    "a rope over {} values; the attention turns {}",
+                    spec_g.rope.dims, t.geom.attn.rot
                 )));
                 ok = false;
             }
@@ -1091,10 +1158,10 @@ fn layer_checks(
             ok = false;
         }
     }
-    if m.expert_ff as usize != EXPERT_K {
+    if m.expert_ff as usize != t.geom.experts.k {
         at.push(refuse(format!(
-            "an expert of {}; the experts run {EXPERT_K}",
-            m.expert_ff
+            "an expert of {}; the experts run {}",
+            m.expert_ff, t.geom.experts.k
         )));
         ok = false;
     }
@@ -1153,7 +1220,7 @@ impl Checked {
     /// the rows arena of the pass the session holds, from the lengths the
     /// open sizes them by.
     pub fn bytes(&self) -> Result<Bytes, SessionError> {
-        let g = &self.layout;
+        let (g, geom) = (&self.layout, &self.geom);
         let mut b = Bytes::default();
         let f32s = |n: usize| count(n) * 4;
         let weights = &mut b.weights;
@@ -1189,21 +1256,29 @@ impl Checked {
                 }
             }
             let f = &layer.ffn;
+            let sh = f.shared.as_ref();
             for s in [
-                &f.gate,
-                &f.up,
-                &f.shexp_gate,
-                &f.shexp_up,
-                &f.down,
-                &f.shexp_down,
-            ] {
+                Some(&f.gate),
+                Some(&f.up),
+                sh.map(|s| &s.gate),
+                sh.map(|s| &s.up),
+                Some(&f.down),
+                sh.map(|s| &s.down),
+            ]
+            .into_iter()
+            .flatten()
+            {
                 b.weights.add(s.bytes());
             }
-            for v in [&f.norm, &f.gate_inp, &f.gate_inp_shexp] {
+            for v in [Some(&f.norm), Some(&f.gate_inp), sh.map(|s| &s.gate_inp)]
+                .into_iter()
+                .flatten()
+            {
                 b.weights.add(f32s(v.len));
             }
             // The router's logits, picks, weights, partials and ticket.
-            for words in [router::ROWS, g.top_k + 1, g.top_k + 1, router::PARTIALS, 1] {
+            let ids = g.top_k + geom.router.shared;
+            for words in [geom.router.rows, ids, ids, geom.router.partials, 1] {
                 b.scratch.add(f32s(words));
             }
         }
@@ -1211,12 +1286,12 @@ impl Checked {
             g.rope_len,
             g.hidden,
             g.proj,
-            VALUE_HEADS * HEAD_COLS,
-            VALUE_HEADS * PARTIALS_PER_HEAD,
+            geom.delta.value_heads * geom.delta.head_cols,
+            geom.delta.partials_stride,
             g.attn_out,
             g.attn_partials,
             1,
-            EXPERT_SLOTS * EXPERT_K,
+            geom.experts.slots * geom.experts.k,
             g.vocab,
             1,
             super::arena::RECORD_SLOTS,
@@ -1231,7 +1306,8 @@ impl Checked {
             b.scratch.add(count(FAULT_WORDS) * 4);
         }
         let lens = RowsLens::of(
-            pass_rows_max().min(g.ctx),
+            geom,
+            pass_rows_max(geom).min(g.ctx),
             g.hidden,
             g.proj,
             g.n_experts,
@@ -1254,107 +1330,154 @@ mod tests {
 
     use super::*;
 
-    /// A qwen35moe file's header and tensor table, in memory: two layers (a
-    /// delta layer, then an attention one: `full_attention_interval` 2) at the
-    /// shapes the kernels run, every weight Q4_K but the head's Q6_K, and no
-    /// weight byte anywhere. A test edits it and reads it back as a `Split`.
+    /// A file's header and tensor table, in memory, at a registered row's
+    /// shapes: two layers (the Qwen3.6 row's a delta layer, then an attention
+    /// one: `full_attention_interval` 2), every weight Q4_K but the head's
+    /// Q6_K, and no weight byte anywhere. A test edits it and reads it back as
+    /// a `Split`.
     struct Synthetic {
         kvs: Vec<(String, Value)>,
         tensors: Vec<(String, Vec<u64>, GgmlType)>,
     }
 
+    /// The Qwen3.6 row's residual width, for the tests that pin its words.
     const HIDDEN: u64 = 2048;
     const VOCAB: u64 = 248_320;
-    const EXPERTS: u64 = 256;
-    const FF: u64 = 512;
+    /// The key heads of the delta layer's conv channels: a file's own count,
+    /// no axis of an instance.
+    const KEY_HEADS: u32 = 16;
 
     impl Synthetic {
+        /// The Qwen3.6-35B-A3B table: [`Synthetic::of`] at its row.
         fn new() -> Synthetic {
-            let u = |k: &str, v: u32| (format!("qwen35moe.{k}"), Value::U32(v));
-            let kvs = vec![
+            Synthetic::of(&instance::QWEN35MOE_A3B)
+        }
+
+        /// The table of a file of `inst`'s shape, its header and tensors at
+        /// the row's axes: two layers, the last of them attention (a gated
+        /// delta layer ahead of it when the row has a delta axis).
+        fn of(inst: &Instance) -> Synthetic {
+            let key = &inst.key;
+            let (arch, pre, delta) = match (key.delta, key.moe.router.rule.gated) {
+                (Some(d), true) => ("qwen35moe", "qwen35", Some(d)),
+                (None, false) => ("qwen3moe", "qwen2", None),
+                _ => panic!("{}: no synthetic file is written for this shape", inst.name),
+            };
+            let u = |k: &str, v: u32| (format!("{arch}.{k}"), Value::U32(v));
+            let a = &key.attn;
+            let ff = key.moe.expert_ff;
+            let mut kvs = vec![
                 (
                     gguf::GENERAL_ARCHITECTURE.to_owned(),
-                    Value::String("qwen35moe".to_owned()),
+                    Value::String(arch.to_owned()),
                 ),
                 (
                     "tokenizer.ggml.pre".to_owned(),
-                    Value::String("qwen35".to_owned()),
+                    Value::String(pre.to_owned()),
                 ),
                 u("block_count", 2),
-                u("vocab_size", 248_320),
+                u(
+                    "vocab_size",
+                    u32::try_from(VOCAB).expect("the vocabulary fits u32"),
+                ),
                 u("context_length", 262_144),
-                u("embedding_length", 2048),
-                u("attention.head_count", 16),
-                u("attention.head_count_kv", 2),
+                u("embedding_length", key.hidden),
+                u("attention.head_count", a.n_head),
+                u("attention.head_count_kv", a.n_kv),
                 (
-                    "qwen35moe.attention.layer_norm_rms_epsilon".to_owned(),
+                    format!("{arch}.attention.layer_norm_rms_epsilon"),
                     Value::F32(1e-6),
                 ),
-                u("expert_count", 256),
-                u("expert_used_count", 8),
-                u("attention.key_length", 256),
-                u("attention.value_length", 256),
-                u("expert_feed_forward_length", 512),
-                u("expert_shared_feed_forward_length", 512),
-                u("ssm.conv_kernel", 4),
-                u("ssm.state_size", 128),
-                u("ssm.group_count", 16),
-                u("ssm.time_step_rank", 32),
-                u("ssm.inner_size", 4096),
-                u("full_attention_interval", 2),
-                (
-                    "qwen35moe.rope.dimension_sections".to_owned(),
-                    Value::Array(vec![
-                        Value::I32(11),
-                        Value::I32(11),
-                        Value::I32(10),
-                        Value::I32(0),
-                    ]),
-                ),
-                (
-                    "qwen35moe.rope.freq_base".to_owned(),
-                    Value::F32(10_000_000.0),
-                ),
-                u("rope.dimension_count", 64),
+                u("expert_count", key.moe.router.experts),
+                u("expert_used_count", key.moe.top_k),
+                u("attention.key_length", a.row.head),
+                u("attention.value_length", a.row.value),
+                u("expert_feed_forward_length", ff),
+                (format!("{arch}.rope.freq_base"), Value::F32(10_000_000.0)),
+                u("rope.dimension_count", a.rot),
             ];
+            if let Some(d) = delta {
+                kvs.extend([
+                    u("expert_shared_feed_forward_length", ff),
+                    u("ssm.conv_kernel", d.conv_taps),
+                    u("ssm.state_size", d.head_cols),
+                    u("ssm.group_count", KEY_HEADS),
+                    u("ssm.time_step_rank", d.value_heads),
+                    u("ssm.inner_size", d.value_heads * d.head_cols),
+                    u("full_attention_interval", 2),
+                    (
+                        "qwen35moe.rope.dimension_sections".to_owned(),
+                        Value::Array(vec![
+                            Value::I32(11),
+                            Value::I32(11),
+                            Value::I32(10),
+                            Value::I32(0),
+                        ]),
+                    ),
+                ]);
+            }
             let mut t = Synthetic {
                 kvs,
                 tensors: Vec::new(),
             };
+            let hidden = u64::from(key.hidden);
+            let (ff, experts) = (u64::from(ff), u64::from(key.moe.router.experts));
             let q = GgmlType::Q4_K;
-            t.add("token_embd.weight", &[HIDDEN, VOCAB], q);
-            t.add("output.weight", &[HIDDEN, VOCAB], GgmlType::Q6_K);
-            t.add("output_norm.weight", &[HIDDEN], GgmlType::F32);
-            for (l, attention) in [false, true].into_iter().enumerate() {
+            t.add("token_embd.weight", &[hidden, VOCAB], q);
+            t.add("output.weight", &[hidden, VOCAB], GgmlType::Q6_K);
+            t.add("output_norm.weight", &[hidden], GgmlType::F32);
+            let (heads, kv, head) = (
+                u64::from(a.n_head),
+                u64::from(a.n_kv),
+                u64::from(a.row.head),
+            );
+            for l in 0..2 {
+                let attention = delta.is_none() || l == 1;
                 let b = |s: &str| format!("blk.{l}.{s}");
-                t.add(&b("attn_norm.weight"), &[HIDDEN], GgmlType::F32);
+                t.add(&b("attn_norm.weight"), &[hidden], GgmlType::F32);
                 if attention {
-                    t.add(&b("attn_q.weight"), &[HIDDEN, 8192], q);
-                    t.add(&b("attn_k.weight"), &[HIDDEN, 512], q);
-                    t.add(&b("attn_v.weight"), &[HIDDEN, 512], q);
-                    t.add(&b("attn_output.weight"), &[4096, HIDDEN], q);
-                    t.add(&b("attn_q_norm.weight"), &[256], GgmlType::F32);
-                    t.add(&b("attn_k_norm.weight"), &[256], GgmlType::F32);
-                } else {
-                    t.add(&b("attn_qkv.weight"), &[HIDDEN, 8192], q);
-                    t.add(&b("attn_gate.weight"), &[HIDDEN, 4096], q);
-                    t.add(&b("ssm_beta.weight"), &[HIDDEN, 32], q);
-                    t.add(&b("ssm_alpha.weight"), &[HIDDEN, 32], q);
-                    t.add(&b("ssm_conv1d.weight"), &[4, 8192], GgmlType::F32);
-                    t.add(&b("ssm_dt.bias"), &[32], GgmlType::F32);
-                    t.add(&b("ssm_a"), &[32], GgmlType::F32);
-                    t.add(&b("ssm_norm.weight"), &[128], GgmlType::F32);
-                    t.add(&b("ssm_out.weight"), &[4096, HIDDEN], q);
+                    let gate = 1 + u64::from(a.q_gate);
+                    t.add(&b("attn_q.weight"), &[hidden, heads * head * gate], q);
+                    t.add(&b("attn_k.weight"), &[hidden, kv * head], q);
+                    t.add(&b("attn_v.weight"), &[hidden, kv * head], q);
+                    t.add(&b("attn_output.weight"), &[heads * head, hidden], q);
+                    t.add(&b("attn_q_norm.weight"), &[head], GgmlType::F32);
+                    t.add(&b("attn_k_norm.weight"), &[head], GgmlType::F32);
+                } else if let Some(d) = delta {
+                    let (vh, hc) = (u64::from(d.value_heads), u64::from(d.head_cols));
+                    let channels = (2 * u64::from(KEY_HEADS) + vh) * hc;
+                    t.add(&b("attn_qkv.weight"), &[hidden, channels], q);
+                    t.add(&b("attn_gate.weight"), &[hidden, vh * hc], q);
+                    t.add(&b("ssm_beta.weight"), &[hidden, vh], q);
+                    t.add(&b("ssm_alpha.weight"), &[hidden, vh], q);
+                    t.add(
+                        &b("ssm_conv1d.weight"),
+                        &[u64::from(d.conv_taps), channels],
+                        GgmlType::F32,
+                    );
+                    t.add(&b("ssm_dt.bias"), &[vh], GgmlType::F32);
+                    t.add(&b("ssm_a"), &[vh], GgmlType::F32);
+                    t.add(&b("ssm_norm.weight"), &[hc], GgmlType::F32);
+                    t.add(&b("ssm_out.weight"), &[vh * hc, hidden], q);
                 }
-                t.add(&b("post_attention_norm.weight"), &[HIDDEN], GgmlType::F32);
-                t.add(&b("ffn_gate_inp.weight"), &[HIDDEN, EXPERTS], GgmlType::F32);
-                t.add(&b("ffn_gate_inp_shexp.weight"), &[HIDDEN], GgmlType::F32);
-                t.add(&b("ffn_gate_exps.weight"), &[HIDDEN, FF, EXPERTS], q);
-                t.add(&b("ffn_up_exps.weight"), &[HIDDEN, FF, EXPERTS], q);
-                t.add(&b("ffn_down_exps.weight"), &[FF, HIDDEN, EXPERTS], q);
-                t.add(&b("ffn_gate_shexp.weight"), &[HIDDEN, FF], q);
-                t.add(&b("ffn_up_shexp.weight"), &[HIDDEN, FF], q);
-                t.add(&b("ffn_down_shexp.weight"), &[FF, HIDDEN], q);
+                let norm = if delta.is_some() {
+                    "post_attention_norm.weight"
+                } else {
+                    "ffn_norm.weight"
+                };
+                t.add(&b(norm), &[hidden], GgmlType::F32);
+                t.add(&b("ffn_gate_inp.weight"), &[hidden, experts], GgmlType::F32);
+                if delta.is_some() {
+                    t.add(&b("ffn_gate_inp_shexp.weight"), &[hidden], GgmlType::F32);
+                }
+                t.add(&b("ffn_gate_exps.weight"), &[hidden, ff, experts], q);
+                t.add(&b("ffn_up_exps.weight"), &[hidden, ff, experts], q);
+                t.add(&b("ffn_down_exps.weight"), &[ff, hidden, experts], q);
+                if delta.is_some() {
+                    t.add(&b("ffn_gate_shexp.weight"), &[hidden, ff], q);
+                    t.add(&b("ffn_up_shexp.weight"), &[hidden, ff], q);
+                    t.add(&b("ffn_down_shexp.weight"), &[ff, hidden], q);
+                }
             }
             t
         }
@@ -1438,11 +1561,11 @@ mod tests {
     /// The error the open met before the collector: `layer_plans` over the
     /// same header, the call the open made.
     fn old_plan_error(split: &Split) -> String {
-        let spec = model::arch::qwen35moe::spec::read(split)
+        let spec = model::arch::spec(split)
             .expect("the description reads")
             .spec;
-        let kinds = kinds35(&spec.layers).expect("the kinds read");
-        let pd = PlanDims::q35(&spec, WHAT).expect("the dims read");
+        let kinds = kinds_of(&spec.layers).expect("the kinds read");
+        let pd = PlanDims::of(&spec, WHAT).expect("the dims read");
         let err = layer_plans(
             split,
             WHAT,
@@ -1457,16 +1580,41 @@ mod tests {
         SessionError::Plan(err).to_string()
     }
 
+    /// Every registered row's file is judged at that row's launch geometry: a
+    /// clean table of the row opens at its instance and geometry, its weights
+    /// are the file's tensors byte for byte, and a norm of another width than
+    /// the row's head is refused by name at the row's own width.
     #[test]
-    fn a_clean_table_opens() {
-        let t = Synthetic::new();
-        let out = check(&t.split(), CTX);
-        assert!(out.items.is_empty(), "{:?}", out.items);
-        let checked = out.checked.expect("a checked file");
-        // The weights the plan counts are the file's tensors, byte for byte.
-        let bytes = checked.bytes().expect("the bytes");
-        assert_eq!(bytes.weights.requested, t.tensor_bytes());
-        assert!(bytes.total().paged >= bytes.total().requested);
+    fn each_registered_instance_is_judged_at_its_own_geometry() {
+        for inst in instance::REGISTERED {
+            let name = inst.name;
+            let t = Synthetic::of(inst);
+            let out = check(&t.split(), CTX);
+            assert!(out.items.is_empty(), "{name}: {:?}", out.items);
+            let checked = out.checked.expect("a checked file");
+            assert_eq!(*checked.instance, *inst, "{name}: the instance");
+            assert_eq!(checked.geom, Geometry::of(inst), "{name}: the geometry");
+            let bytes = checked.bytes().expect("the bytes");
+            assert_eq!(
+                bytes.weights.requested,
+                t.tensor_bytes(),
+                "{name}: the weights"
+            );
+            assert!(bytes.total().paged >= bytes.total().requested, "{name}");
+
+            let head = inst.key.attn.row.head;
+            let wrong = u64::from(head) + 32;
+            let t = t.dims("blk.1.attn_q_norm.weight", &[wrong]);
+            let got = texts(&t.split(), CTX);
+            assert_eq!(
+                got,
+                [format!(
+                    "qwen35moe arena: layer 1: blk.1.attn_q_norm.weight is F32 [{wrong}]; the step \
+                     reads {head} F32 values"
+                )],
+                "{name}"
+            );
+        }
     }
 
     /// One class of buffers from the byte size of each: how many, the bytes
@@ -1487,10 +1635,12 @@ mod tests {
     #[test]
     fn the_bytes_pin_each_class_of_buffers() {
         use super::super::arena::RECORD_SLOTS;
-        use crate::kernels::{LOGIT_STRIDE, RING_ROWS, prepared_elems, route_table_words};
+        use crate::kernels::route_table_words;
 
-        const N_K: usize = 16;
+        const N_K: usize = KEY_HEADS as usize;
         const TOP_K: usize = 8;
+        let g = Geometry::of(&instance::QWEN35MOE_A3B);
+        let (value_heads, head_cols) = (g.delta.value_heads, g.delta.head_cols);
         let hidden = HIDDEN as usize;
         let vocab = VOCAB as usize;
         let t = Synthetic::new();
@@ -1499,38 +1649,40 @@ mod tests {
         let f32s = |n: usize| count(n) * 4;
 
         // The K and the V cache of the attention layer, f16.
-        let cache = count(KV_HEADS * CTX * HEAD_DIM) * 2;
+        let cache = count(g.attn.kv_heads * CTX * g.attn.head) * 2;
         assert_eq!(bytes.kv, class(&[cache, cache]));
 
         // The delta layer's state lanes and its conv ring.
-        let channels = (2 * N_K + VALUE_HEADS) * HEAD_COLS;
+        let channels = (2 * N_K + value_heads) * head_cols;
         assert_eq!(
             bytes.state,
             class(&[
-                f32s(LANES * VALUE_HEADS * HEAD_COLS * HEAD_COLS),
-                f32s(RING_ROWS * channels),
+                f32s(LANES * value_heads * head_cols * head_cols),
+                f32s(g.delta.ring_rows * channels),
             ])
         );
 
         // Each layer's router (logits, picks, weights, partials, ticket), then
         // the token arena's buffers in field order.
-        let router = [router::ROWS, TOP_K + 1, TOP_K + 1, router::PARTIALS, 1];
-        let proj = channels + VALUE_HEADS * HEAD_COLS + 2 * VALUE_HEADS;
-        let attn_partials =
-            partials_len(segments_for_keys(CTX as u32) as usize).expect("the partials fit");
+        let router = [g.router.rows, TOP_K + 1, TOP_K + 1, g.router.partials, 1];
+        let proj = channels + value_heads * head_cols + 2 * value_heads;
+        let attn_partials = g
+            .attn
+            .partials_len(segments_for_keys(CTX as u32) as usize)
+            .expect("the partials fit");
         let mut scratch: Vec<u64> = [router, router].concat().into_iter().map(f32s).collect();
         scratch.extend(
             [
-                hidden,                          // x
-                proj,                            // proj
-                VALUE_HEADS * HEAD_COLS,         // g
-                VALUE_HEADS * PARTIALS_PER_HEAD, // delta_partials
-                VALUE_HEADS * HEAD_COLS,         // attn
-                attn_partials,                   // attn_partials
-                1,                               // attn_ticket
-                CTX * ROT,                       // rope
-                EXPERT_SLOTS * EXPERT_K,         // h
-                vocab,                           // logits
+                hidden,                        // x
+                proj,                          // proj
+                value_heads * head_cols,       // g
+                g.delta.partials_stride,       // delta_partials
+                value_heads * head_cols,       // attn
+                attn_partials,                 // attn_partials
+                1,                             // attn_ticket
+                CTX * g.attn.rot,              // rope
+                g.experts.slots * g.experts.k, // h
+                vocab,                         // logits
             ]
             .map(f32s),
         );
@@ -1542,24 +1694,24 @@ mod tests {
         // The rows arena of a pass of `cap` rows: ids, residual, normed input,
         // P1 output, mixer rows, delta partials and prepared rows, logits, four
         // slot lists, the route table, the pair's and the down's outputs.
-        let cap = pass_rows_max().min(CTX);
-        let slots = cap * EXPERT_SLOTS;
-        let prepared = prepared_elems(N_K).expect("the prepared row fits");
+        let cap = pass_rows_max(&g).min(CTX);
+        let slots = cap * g.experts.slots;
+        let prepared = g.delta.prepared_elems(N_K).expect("the prepared row fits");
         let rows = [
             cap,
             cap * hidden,
             cap * hidden,
             cap * proj.next_multiple_of(4),
-            cap * VALUE_HEADS * HEAD_COLS,
-            cap * VALUE_HEADS * PARTIALS_PER_HEAD,
+            cap * value_heads * head_cols,
+            cap * g.delta.partials_stride,
             cap * prepared,
-            cap * LOGIT_STRIDE,
+            cap * g.router.logit_stride,
             slots,
             slots,
             slots,
             slots,
-            route_table_words(slots, router::EXPERTS),
-            slots * EXPERT_K,
+            route_table_words(slots, g.router.experts),
+            slots * g.experts.k,
             slots * hidden,
         ]
         .map(f32s);
@@ -1568,18 +1720,32 @@ mod tests {
 
     #[test]
     fn the_architecture_verdict_is_the_one_item() {
+        // An architecture no description reader reads.
         let t = Synthetic::new().kv(
             gguf::GENERAL_ARCHITECTURE,
-            Value::String("qwen3moe".to_owned()),
+            Value::String("deepseek2".to_owned()),
         );
         let got = texts(&t.split(), CTX);
         assert_eq!(got.len(), 1, "{got:?}");
         assert!(
             got[0].starts_with("qwen35moe session: synthetic.gguf: ")
-                && got[0].contains(gguf::GENERAL_ARCHITECTURE)
-                && got[0].contains("\"qwen3moe\""),
+                && got[0].contains("unsupported architecture \"deepseek2\""),
             "{got:?}"
         );
+    }
+
+    #[test]
+    fn a_shape_no_instance_is_built_for_is_the_opens_first_item() {
+        let t = Synthetic::new().kv("qwen35moe.expert_used_count", Value::U32(6));
+        let split = t.split();
+        let got = texts(&split, CTX);
+        assert!(
+            got.first().is_some_and(|e| e
+                .starts_with("qwen35moe session: synthetic.gguf: no instance is built for ")
+                && e.contains("top 6")),
+            "{got:?}"
+        );
+        assert!(check(&split, CTX).checked.is_none());
     }
 
     #[test]

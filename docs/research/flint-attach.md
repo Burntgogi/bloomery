@@ -126,7 +126,7 @@ Its fresh4bin/8carrier canonical comparison again found all1657entries identical
 with non-JIT rows equal. Native formatting/Clippy passed (warning3=ratchet3); model557 and
 placement202 passed,0 failed,5 model tests ignored,0 filtered.
 
-The reviewed contract source `7e37ef9a6ebbd766032ee521a0ee16e25f163851`
+The historical component contract source `7e37ef9a6ebbd766032ee521a0ee16e25f163851`
 executed the real CUDA mixed/empty-tier consumer on RTX3090 cc8.6:1 passed,
 0 failed/ignored,427 filtered,23.98s. Its metadata-only
 `a_dense_header_plans_through_qwen35_on` frontend consumer also passed1 case,
@@ -137,6 +137,12 @@ An exact-source7e37ef9a canonical comparison against main15778e2c found all1657
 entries identical across4bins/8carriers and non-JIT rows equal; it did not compare
 driver-JIT resource rows. The older full-library counts above remain historical,
 not a new full-library run of the review repairs.
+
+The component subsequently merges pinned upstream `cb8d92ebddd1ce1a325a15450c06a01f57ecf88c`.
+That reconciliation retains upstream's GLM mixer-form consumers alongside this component's
+checked tier-byte API; the explicit-form API has no input-scale flag. The execution results
+above belong to their named historical sources, not the merged source. No new runtime or
+canonical-equivalence result is claimed by this merge.
 
 The host-only public planner consumer covers one-byte boundaries before the first resident layer
 and before adding another down form, plus descriptor overflow refusal. These and the CUDA consumer

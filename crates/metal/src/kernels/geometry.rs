@@ -1,3 +1,5 @@
+use crate::instance::HOST;
+
 /// The width of a SIMD group on every Apple GPU.
 pub const SIMD_WIDTH: usize = 32;
 
@@ -31,11 +33,15 @@ pub const BLOCK_VALUES: usize = 256;
 pub const MAX_SEGMENTS: usize = 4;
 
 /// The value heads a gated delta net's out projection reads: its head scale
-/// and its partial sums are per head.
-pub const VALUE_HEADS: usize = 32;
+/// and its partial sums are per head. A shim: the build's host instance's
+/// delta axes. Callers left: the arch, the e2e and kernel gates, their
+/// oracles and the probes.
+pub const VALUE_HEADS: usize = HOST.delta_built().value_heads as usize;
 
-/// The columns one value head's gated output holds.
-pub const HEAD_COLS: usize = 128;
+/// The columns one value head's gated output holds. A shim: the build's host
+/// instance's delta axes. Callers left: the arch, the e2e and kernel gates,
+/// their oracles and the probes.
+pub const HEAD_COLS: usize = HOST.delta_built().head_cols as usize;
 
 /// The column blocks one head's partial sums are split into.
 pub const PARTIALS_PER_HEAD: usize = 8;
