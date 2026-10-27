@@ -238,6 +238,13 @@ entries identical across4bins/8carriers and non-JIT rows equal; it did not compa
 driver-JIT resource rows. The older full-library counts above remain historical,
 not a new full-library run of the review repairs or a run of this integration.
 
+At component merged source `c38d603ca1d33c6c2bede63aba102199715fb9ef`, native formatting
+and all-target Clippy passed, as did chain23, GGUF67, model559 and placement202
+(five model cases ignored, zero failed/filtered). The actual oxide-linked
+`a_dense_header_plans_through_qwen35_on` frontend consumer passed1 case,
+0 failed/ignored,6 filtered, including the named expert-tier refusal.
+This is metadata-only host execution, not fresh NVIDIA execution or a run of this integration.
+
 The host-only planner covers one-byte boundaries before the first resident layer and another
 down form, plus descriptor overflow refusal. Neither this nor the component CUDA proof is a
 whole-model oracle or every affected model/residency gate; canonical equality does not waive
